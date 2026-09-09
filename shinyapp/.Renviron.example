@@ -1,0 +1,4 @@
+# Optional services. Leave blank for prediction and local template preview only.
+BREVO_API_KEY=
+SENDER_EMAIL=
+TINYMCE_API_KEY=

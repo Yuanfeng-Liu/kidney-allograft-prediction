@@ -1,0 +1,13 @@
+.Renviron
+.Renviron.*
+!.Renviron.example
+secrets.R
+rsconnect/
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+.DS_Store
+__MACOSX/
+._*
+*.log
