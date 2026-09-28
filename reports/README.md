@@ -1,9 +1,15 @@
-# Submitted reports and presentation
+# Reports and presentation
 
-- `final-report.html` and `appendix.html` are self-contained copies of the submitted group documents. Download and open them locally to view the formatted reports, plots, tables, and folded source code.
-- `presentation.pptx` retains all 20 slides and the original visual assets. The embedded demonstration recording was removed because it displayed personal email addresses and a private inbox. Slide 18 retains its original static application image; it no longer plays the recording.
-- `plots_finalReport.rds` and `models_evaluation.rds` are the original saved report assets. The plot cache is large because it preserves R plot objects, not just exported images.
+| File | Contents |
+|---|---|
+| `final-report.html` | Main report, including methods, findings, discussion, and team contributions |
+| `appendix.html` | Detailed analysis, plots, tables, and source code |
+| `presentation.pptx` | The group's 20-slide presentation |
+| `plots_finalReport.rds` | Saved R plot objects used by the report |
+| `models_evaluation.rds` | Saved model-evaluation results |
 
-These documents describe the historical course submission. The README uses the final confusion matrices for its reported performance: biopsy 61 evaluated samples and blood 54. Older rounded accuracy claims and cohort-size descriptions in the presentation and report should not be treated as new evaluation results.
+Download the HTML files and open them in a browser to view the formatted reports and expandable code sections. The [Quarto source](../analysis/) is also available.
 
-The source archives and the unmodified presentation remain outside this repository. Service secrets, private deployment settings, the private demonstration recording, and macOS metadata are not included in this release. Other group members use consistent anonymous labels (Member A through Member E); contribution statements are retained. Personal names, school account links, and presentation author and comment metadata have been removed from this public copy.
+These documents record the course submission. The [main README](../README.md) calculates performance from the final confusion matrices: 61 evaluated biopsy samples and 54 blood samples. Some summary figures in the original report and slides use different cohort counts or rounded accuracy values; consult the final confusion matrices when comparing results.
+
+Other group members are identified as Member A–E, with their contributions retained. The presentation's embedded demo recording was removed for privacy; slide 18 still contains the static application screenshot.

@@ -1,37 +1,34 @@
-# Setup and reproducibility notes
+# Setup notes
 
-## 1. Install application dependencies
+## Start the application
 
-Start R from the repository root. R 4.1 or later is required because the source uses the native `|>` pipe.
+Use R 4.1 or later and start R from the repository root:
 
 ```r
 source("setup.R")
-```
-
-This installs missing packages from CRAN; it does not retrain the models. Package availability and operating-system build requirements may vary. The original submission did not include a dependency lockfile or a recorded compatible package set. In particular, the archived XGBoost and ranger RDS files may need package versions compatible with their original serialisation. Do not interpret the installation helper as a verified reconstruction of the original environment.
-
-## 2. Launch and inspect the sample
-
-```r
 shiny::runApp("shinyapp")
 ```
 
-Shiny runs the application with `shinyapp/` as its working directory, where the relative `models/`, `email/`, and `interface_text/` paths resolve.
+`setup.R` installs missing application packages from CRAN. It does not train models or install all packages needed for the analysis. Shiny runs the app from `shinyapp/`, where its relative paths to models, templates, and interface text resolve.
+
+The original submission has no dependency lockfile. The saved XGBoost and ranger models may require package versions compatible with their original RDS files. Installation and inference have not been tested for this public version, so the setup script does not guarantee a working environment on every machine.
+
+## Try the example data
 
 1. Open **Risk Prediction**, then **Data Upload**.
 2. Choose **Blood** or **Biopsy**.
 3. Upload `shinyapp/examples/eMat_example.csv` and inspect the preview.
-4. Press **Next** to generate labels and use **Download** for the results CSV.
+4. Press **Next** to generate labels, then **Download** to save the results CSV.
 
-The bundled expression example contains 23,307 gene rows and seven sample columns. Both model-specific gene lists are present. Every selected gene has saved normalisation statistics and a non-zero saved standard deviation. These are static file checks, not a successful R inference run.
+The example contains 23,307 gene rows and seven sample columns, including the genes required by both models. The app selects 400 genes for blood or 200 for biopsy and standardises them with saved training means and standard deviations. Model outputs strictly above **0.4 for blood** or **0.3 for biopsy** receive the `reject` label; the rest receive `stable`.
 
-The application selects 400 blood genes or 200 biopsy genes, standardises with saved training means and standard deviations, and loads the corresponding pre-trained RDS model. It applies a strict `>` threshold of 0.4 for blood or 0.3 for biopsy. The input must be a numeric expression matrix compatible with the original training representation, not sequencing reads. The app does not reproduce training-time harmonisation or batch correction for new uploads.
+Use a numeric expression matrix compatible with the training measurements, not raw sequencing reads. The app does not perform the training analysis's harmonisation or batch correction on new uploads. Its performance summaries come from the submitted evaluation, not from a fresh evaluation of the uploaded file.
 
-## 3. Optional email configuration
+## Optional email features
 
-Prediction works without credentials. You can upload the fictional contact example to edit and preview email templates; sending remains disabled without both required settings.
+Prediction and template preview need no service credentials. To try the contact-upload interface, use `shinyapp/examples/patients_example.csv`, which contains fictional names and `example.com` addresses matching the expression sample IDs.
 
-Use `shinyapp/.Renviron.example` as a reference. Place a private `.Renviron` in the repository root before starting R, or configure the equivalent environment variables in your process or hosting environment:
+Sending is disabled until you supply both a Brevo API key and a sender address. Use `shinyapp/.Renviron.example` as a reference and place your private `.Renviron` in the repository root before starting R, or set these variables in your process or hosting environment:
 
 ```text
 BREVO_API_KEY=
@@ -39,20 +36,18 @@ SENDER_EMAIL=
 TINYMCE_API_KEY=
 ```
 
-- `BREVO_API_KEY`: your own Brevo API credential, only needed for sending.
-- `SENDER_EMAIL`: your own sender address configured for that service.
-- `TINYMCE_API_KEY`: optional TinyMCE cloud editor configuration. It is sent to the browser as part of that editor's script URL; never substitute an unrelated private credential.
+- `BREVO_API_KEY`: your Brevo sending credential.
+- `SENDER_EMAIL`: a sender address configured for that service.
+- `TINYMCE_API_KEY`: optional configuration for the cloud text editor. This value is included in a browser script URL; use a TinyMCE key only.
 
-Restart R after changing a startup `.Renviron`, or load your private environment configuration before launching the app. The repository ignores `.Renviron`, `secrets.R`, and deployment configuration. No original service credential is included.
+Restart R after changing `.Renviron`. The repository ignores `.Renviron`, `secrets.R`, and deployment configuration.
 
-Without TinyMCE configuration, the modal uses an HTML text area and a sandboxed preview. Placeholder text such as `{name}` is filled when the optional sending action runs. Without email configuration, both the send control and server-side send action are disabled. No email is sent merely by starting the application or generating predictions.
+Without TinyMCE, the app provides an HTML text area and preview. Placeholders such as `{name}` are filled during the sending action. Starting the app or generating predictions does not send email. The example addresses are for previewing the interface, not for delivery.
 
-`examples/patients_example.csv` preserves the expression sample IDs but uses `Example Patient` names and `example.com` addresses. It is for demonstrating the UI; those addresses are not delivery targets. The inherited email workflow is a coursework demonstration and has not been validated for operational use.
+## Results and limitations
 
-## 4. What has and has not been checked
+The saved models and reported results come from the original coursework submission. File checks confirmed that the example includes the selected genes and that their saved normalisation statistics have non-zero standard deviations. These checks do not establish runtime compatibility; R inference, email delivery, and deployment have not been tested for this public version.
 
-Publication preparation statically checks the archive paths, model/normalisation assets, preserved sample IDs, configuration removal, and unchanged prediction code. Saved model bytes are retained. R was not executed, dependencies were not installed, and neither the email service nor a deployment was contacted.
+The biopsy source-cohort overview lists 82 samples, while its final confusion matrix contains 61 evaluated samples. The blood confusion matrix contains 54. The README uses those final evaluation counts and derives its metrics from the matrices; the report and appendix provide the surrounding analysis.
 
-The README reports historical held-out results: biopsy 61 evaluated samples, accuracy 0.7705, sensitivity 0.9286, specificity 0.6364; blood 54 samples, accuracy 0.5926, sensitivity 0.8571, specificity 0.3077. The original dataset overview mentions 82 samples in the held-out biopsy source cohort; the reported final confusion matrix contains 61 evaluated samples. Use the report and appendix for the analysis cohort definition rather than treating these two counts as interchangeable.
-
-The application shows stored performance summaries, not a fresh evaluation of an uploaded file. It has no clinical validation, and its outputs and inherited communication templates should not be used to make diagnosis or treatment decisions.
+The application is a research demonstration without clinical validation. Its labels and inherited email templates are not intended for diagnosis or treatment decisions. See [analysis/README.md](../analysis/README.md) for what is needed to rerun the analysis.

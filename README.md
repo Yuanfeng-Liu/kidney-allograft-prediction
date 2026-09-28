@@ -1,72 +1,51 @@
 # Kidney Allograft Rejection Prediction
 
-An R machine learning and Shiny group project for **DATA3888 Biomedical Data Science**. It investigates whether gene expression from blood or kidney biopsies can distinguish transplant rejection from graft stability, then packages the selected models into an interactive demonstration.
+This **DATA3888 Biomedical Data Science** group project examined whether gene-expression measurements could distinguish kidney transplant rejection from graft stability. We compared models built from blood and biopsy data and developed a Shiny application to demonstrate the predictions.
 
-The main result is a comparison of two complete prediction pathways: a biopsy model with stronger held-out discrimination and a less invasive blood-based alternative whose high sensitivity comes with substantial false positives. This is a coursework research prototype, with **no clinical validation**.
+The biopsy model had higher sensitivity and specificity in its evaluation cohort. The blood model detected most rejection cases, but its low specificity meant that many stable samples were also flagged.
 
-## The problem and what made it difficult
+## My contribution — Yuanfeng Liu
 
-**Combining separate studies.** Gene expression measurements came from multiple Gene Expression Omnibus datasets, with different platforms, gene coverage, and batch effects. Cleaning and harmonising these studies was necessary before a classifier could learn rejection-related signals. The reported workflow examines coverage, combines compatible data, and applies batch correction; a separate dataset is reserved for evaluation.
+I cleaned six of the 12 study datasets, contributed to feature-selection code, and wrote and debugged the biopsy modelling code. I worked with Member C on cross-validation and parameter tuning. I also helped with parts of the Shiny code, explanatory diagrams, and the presentation.
 
-**Many genes, relatively few samples.** Thousands of candidate genes made overfitting a central concern. The team compared six feature-selection approaches and different gene counts, then used five-fold cross-validation to compare and tune candidate models. The final pathways use **200 genes selected by mutual information for biopsy** and **400 genes selected by a t-test for blood**.
+This was a six-person project. The other contributors are listed as **Member A–E** for privacy, and the [report](reports/final-report.html) retains the team's contribution table.
 
-**Balancing missed rejection against false alarms.** Accuracy alone can hide clinically relevant errors. The selected thresholds favour sensitivity, and the held-out results make the resulting specificity trade-off explicit. The blood model catches most rejection cases but also flags many stable samples.
+## Analysis and results
 
-**Delivering the analysis as an application.** The Shiny interface accepts an expression matrix, checks the required genes, applies saved training statistics and model parameters, and presents downloadable patient-level labels. Model-insight pages explain the data and methodology. Optional editable email templates demonstrate a communication workflow.
+The analysis combined compatible GEO studies, addressed batch effects, and compared six feature-selection methods. We used five-fold cross-validation to compare and tune models, with separate datasets reserved for evaluation. The selected models were a random forest using 200 biopsy genes and XGBoost using 400 blood genes.
 
-## Historical evaluation results
-
-These values are taken from the submitted report and its held-out confusion matrices. **They have not been reproduced by rerunning training or evaluation for this repository publication.** Rejection is the positive class.
+The following results are calculated from the submitted report's held-out confusion matrices, with rejection as the positive class:
 
 | Input | Feature selection | Model | Evaluated samples | Accuracy | Sensitivity | Specificity |
 |---|---|---|---:|---:|---:|---:|
-| Biopsy | Mutual information, 200 genes | Random Forest | 61 | 0.7705 | 0.9286 | 0.6364 |
+| Biopsy | Mutual information, 200 genes | Random forest | 61 | 0.7705 | 0.9286 | 0.6364 |
 | Blood | t-test, 400 genes | XGBoost | 54 | 0.5926 | 0.8571 | 0.3077 |
 
-The biopsy confusion matrix has 26 true positives, 21 true negatives, 2 false negatives, and 12 false positives. The blood matrix has 24 true positives, 8 true negatives, 4 false negatives, and 18 false positives. Thus, the biopsy model missed fewer rejection samples and made fewer false alarms in these evaluation cohorts; these are separate cohorts, not a paired comparison on the same patients.
+The biopsy model missed 2 of 28 rejection cases and flagged 12 of 33 stable samples. The blood model missed 4 of 28 rejection cases and flagged 18 of 26 stable samples. These results come from **different cohorts**, so they are not a paired comparison of blood and biopsy measurements from the same patients.
 
-Stored classification thresholds are **0.3 for biopsy** and **0.4 for blood**; the app predicts `reject` only when the model output is strictly greater than the relevant threshold. Its result table exports class labels, not calibrated clinical risk estimates.
+The repository includes the submitted models and results; training and evaluation have not been rerun for this public version. This is a coursework research prototype without clinical validation.
 
-## Run the Shiny demonstration
+## Browse the work
 
-Use R 4.1 or later and start R from the repository root:
+- [Final report](reports/final-report.html): methods, findings, discussion, and team contributions.
+- [Technical appendix](reports/appendix.html): data preparation, feature selection, and model development.
+- [Analysis source](analysis/): Quarto source for both reports.
+- [Presentation](reports/presentation.pptx): the group's 20-slide presentation.
+- [Shiny application](shinyapp/app.R): expression-matrix upload, predictions, model summaries, and downloads.
+
+Download the HTML reports and open them in a browser to view the formatted pages.
+
+## Run the demonstration
+
+With R 4.1 or later, start R from the repository root:
 
 ```r
 source("setup.R")
 shiny::runApp("shinyapp")
 ```
 
-Select **Blood** or **Biopsy**, upload `shinyapp/examples/eMat_example.csv`, review the matrix, then generate and download predictions. The matrix has genes in rows and sample IDs in columns. The optional contact example uses fictional names and `example.com` addresses.
+Choose **Blood** or **Biopsy** and upload `shinyapp/examples/eMat_example.csv`. The file has genes in rows and sample IDs in columns. The app selects the required genes, standardises them using saved training statistics, and returns `reject` or `stable` labels. The stored thresholds are **0.4 for blood** and **0.3 for biopsy**, with `reject` assigned only above the threshold.
 
-Prediction and email-template editing/preview do not require service credentials. Email sending is disabled until `BREVO_API_KEY` and `SENDER_EMAIL` are configured. A TinyMCE cloud editor is optional; the default provides a local HTML text editor and preview. See [setup and limitations](docs/SETUP.md).
+New uploads must already be compatible with the training data: the app does not repeat the analysis's batch-correction workflow. Its outputs are class labels, not calibrated clinical risk estimates.
 
-## Explore the project
-
-| Material | Contents |
-|---|---|
-| [Final report](reports/final-report.html) | Study motivation, methods, findings, and discussion |
-| [Technical appendix](reports/appendix.html) | Detailed analysis and model development |
-| [Appendix source](analysis/appendix.qmd) | Quarto analysis source extracted from the submission |
-| [Presentation](reports/presentation.pptx) | Group presentation; private embedded demo recording removed |
-| [Shiny application](shinyapp/app.R) | Prediction, explanation, downloads, and optional email UI |
-| [Saved model assets](shinyapp/models/) | Models, selected genes, normalisation statistics, and thresholds |
-
-The reported training workflow includes batch correction. The deployed prediction path performs gene selection and standardisation with saved means and standard deviations; it does **not** implement a new-upload batch-correction workflow. An arbitrary expression file is therefore not automatically compatible with the original training measurements.
-
-## Team and contribution
-
-Other contributors are represented by consistent anonymous labels for privacy. These labels preserve the original division of work and do not imply sole authorship by Yuanfeng Liu.
-
-This is the work of **Member A, Member B, Member C, Member D, Yuanfeng, and Member E**, DATA3888 Biomed Group 22. Model development, analysis, reporting, and application delivery were group efforts.
-
-Yuanfeng's documented contributions include biopsy data cleaning, feature-selection implementation, initial biopsy models, cross-validation and tuning with Member C, simplification of explanatory diagrams, and the presentation. These contributions should be read in the context of the full team's work, rather than as sole authorship of the project.
-
-## Scope of this release
-
-The submission's pre-trained model assets are preserved. Publication preparation removes private service configuration and deployment metadata, replaces example contact details, adds environment-based optional service settings, and documents setup and historical results. The welcome-page metric summary is aligned with the reported confusion matrices.
-
-No R execution, model retraining, package installation, email delivery, or live deployment was performed during preparation. There is no original dependency lockfile, so compatibility of the archived RDS models with newly installed package versions remains unverified. This application and its inherited communication templates are for research demonstration, not diagnosis or patient-care decisions.
-
-## 中文简介
-
-本项目解决跨研究基因表达数据难以直接合并、基因数量多而样本有限，以及漏检和误报需要权衡的问题。团队完成数据清洗、批次校正、特征选择和五折模型调优，并将结果交付为 Shiny 演示应用。活检分支使用 200 个基因和随机森林，血液分支使用 400 个基因和 XGBoost。历史独立评估中，活检模型在 61 个样本上的准确率为 77.05%、敏感度为 92.86%；血液模型在 54 个样本上的准确率为 59.26%、敏感度为 85.71%。血液模型特异度只有 30.77%，说明误报仍多。这是小组课程研究原型，尚未经过临床验证。
+Email-template preview is available with fictional example contacts; sending requires your own service settings. See [setup notes](docs/SETUP.md) for configuration, model compatibility, and analysis dependencies.
