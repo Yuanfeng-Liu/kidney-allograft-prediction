@@ -1,0 +1,3834 @@
+---
+title: "[DATA3888] Appendix"
+format: 
+  html:
+    code-tools: true
+    code-fold: true
+    fig_caption: yes
+    number_sections: yes
+    embed-resources: true
+    theme: flatly
+    toc: true
+    toc_depth: 4
+    toc_float: true
+execute: 
+  echo: true
+  tidy: true
+---
+
+# Logistic Process
+
+## Import libraries
+
+```{r libraries, warning = FALSE, message = FALSE  }
+library(DT)
+library(stringr)
+library(GEOquery)
+library(ggplot2)
+library(limma)
+library(dplyr)
+library(Biobase)
+library(caret)
+library(randomForest)
+library(e1071)
+library(glmnet)
+library(pROC)
+library(janitor)
+library(sva)
+library(ggpubr)
+library(limma)
+library(randomForest) 
+library(class)
+library(ranger)
+library(NMF)
+library(mRMRe)
+library(infotheo)
+library(xgboost)
+library(cvTools)
+library(tidyr)
+library(siggenes)
+library(FSelector)
+library(plotly)
+library(matrixStats)
+library(RColorBrewer)
+set.seed(3888)
+```
+
+## Self-written functions
+
+### \[Cleaning\] Remove duplicated gene symbols
+
+```{r remove_duplicate_id, warning = FALSE, message = FALSE  }
+limma_duplicates = function(eMat, fdata, pdata) {
+  # filter out genes that have been excluded from eMat
+  fdata = fdata %>% filter(ID %in% rownames(eMat))
+  # extract genes with duplicated gene symbols in feature data
+  f_duplicates = fdata |> group_by(gene_symbols) |> filter(n() > 1)
+  f_uniques = fdata |> group_by(gene_symbols) |> filter(n() == 1)
+  # group these genes by their gene symbols
+  f_groups = f_duplicates |> group_split()
+  # create an empty list to store gene ids of those with significant values
+  sig_gid = character(length = length(f_groups))
+  # create design matrix based on the outcome
+  design = model.matrix(~pdata$outcome)
+  # loop through each group of duplicated gene symbols
+  for (i in 1:length(f_groups)) {
+    group = f_groups[[i]]
+    # filter the expression matrix to only include the gene symbol being considered
+    e_duplicated = eMat[as.character(group$ID),]
+    # fit limma
+    fit = lmFit(e_duplicated, design) |> eBayes()
+    ranking = topTable(fit)
+    # select the 1st ranked to be the significant gene
+    sig_gid[i] = rownames(ranking)[1]
+  }
+  # retain only the ides with unique gene symbols and the significant genes in the duplicated ones
+  f_retain = c(f_uniques$ID, sig_gid)
+  e = eMat[f_retain,]
+  # change the rownames of the expression matrix into gene symbols
+  rownames(e) = fdata[rownames(e),]$gene_symbols
+  return(e)
+}
+```
+
+### \[Feature selection + Modelling\] Z-score normalisation
+
+```{r normalize_func, warning = FALSE, message = FALSE  }
+# z-score normalization
+normalize = function(train, test) {
+  # find the mean and sd per gene in the train set
+  mean_train = apply(train, 1, mean)
+  sd_train = apply(train, 1, sd)
+  sd_train[sd_train == 0] = 1
+  # scale both train and test set by the mean and sd value per gene of the train set
+  train_scaled = sweep(train, 1, mean_train, '-') |>
+    sweep(1, sd_train, '/')
+  test_scaled = sweep(test, 1, mean_train, '-') |>
+    sweep(1, sd_train, '/')
+  return(list(train = train_scaled, test = test_scaled))
+}
+```
+
+### \[Feature selection\] Cross-validated pre-processing
+
+```{r fs_preprocess_func, warning = FALSE, message = FALSE  }
+# function to ensure preprocessing are done uniformly for each selection method
+fs_preproc = function(eMat = X_train, pData = y_train, test_fold) {
+  # split train-test set
+  pData_train = pData |> filter(fold != test_fold)
+  pData_test = pData |> filter(fold == test_fold)
+  eMat_train = eMat[,pData_train$geo_accession]
+  eMat_test = eMat[,pData_test$geo_accession]
+  # batch correct test and train set
+  train_batched = ComBat(eMat_train, pData_train$original_dataset)
+  test_batched = ComBat(eMat_test, pData_test$original_dataset)
+  # normalize
+  norm = normalize(train = train_batched, test = test_batched)
+  train_normed = norm$train
+  test_normed = norm$test
+  return(list(x_train = train_normed,
+              x_test = test_normed,
+              y_train = pData_train,
+              y_test = pData_test))
+}
+```
+
+### \[Feature selection\] Mutual Information score calculation
+
+```{r mutual_info_function, warning = FALSE, message = FALSE  }
+mi_score = function(eMat, pData) {
+  # discretize the data
+  eMat_disc = discretize(eMat, dis = 'equalfreq')
+  # compute mutual information between each gene and the class labels
+  scores = apply(eMat_disc, 1, function(gid) mutinformation(gid, pData$outcome))
+  # rank and select top featuers
+  genes = eMat |> rownames()
+  mi_res = data.frame(genes)
+  mi_res$mi_score = scores
+  mi_rank = mi_res %>% arrange(desc(mi_score))
+  return(mi_rank$genes)
+}
+```
+
+### \[Feature selection\] Fisher score calculation
+
+$$
+S_i = \frac{\sum_jn_j(\mu_{ij}-\mu_i)^2}{\sum_jn_j\sigma^2_{ij}} = \frac{\text{between-class variance}}{\text{within-class variance}}
+$$
+
+where
+
+-   $n_j$: number of patients with the $j^{th}$ outcome *(reject or stable)*
+
+-   $\mu_i$: global mean of the $i^{th}$ gene
+
+-   $\mu_{ij}$: mean of the $i^{th}$ gene that belongs to the $j^{th}$ outcome
+
+-   $\sigma^2_{ij}$: variance of the $i^{th}$ gene that belongs to the $j^{th}$ outcome
+
+```{r fisher_score_function, warning = FALSE, message = FALSE  }
+fisher_score = function(eMat, pData) {
+  label = pData$outcome
+  n_genes = nrow(eMat)
+  classes = levels(label)
+  # initialize an empty vector to store Fisher scores for each gene
+  fisher_scores = numeric(nrow(eMat))
+  # total means per gene
+  total_means = rowMeans2(eMat)
+  # class sizes
+  class_sizes = table(label)
+  # variance terms
+  between_class_var = numeric(n_genes)
+  within_class_var = numeric(n_genes)
+  for (class in classes) {
+    idx = which(label == class)
+    eMat_class = eMat[,idx, drop = FALSE]
+    # class-specific means and variances
+    class_means = rowMeans2(eMat_class)
+    class_vars = rowVars(eMat_class)
+    n_k = length(idx)
+    between_class_var = between_class_var + n_k * (class_means - total_means)^2
+    within_class_var = within_class_var + n_k * class_vars
+  }
+  fisher_scores = between_class_var / within_class_var
+  return(data.frame(
+    row.names = rownames(eMat),
+    fisher_score = fisher_scores
+  )) |> arrange(desc(fisher_score))
+}
+```
+
+### \[Modelling\] Differential Expression Analysis
+
+#### Blood
+
+```{r blood_de_func, warning = FALSE, message = FALSE  }
+# t-test
+blood_de = function(eMat_train, pData_train) {
+  # perform t-test per gene
+  t_test = apply(eMat_train, 1, function(gene) {
+    t.test(gene~pData_train$outcome)$p.value
+  })
+  # arrange genes with ascending p-value resulted from the t-test
+  rank = data.frame(
+    row.names = rownames(eMat_train),
+    pval = t_test
+  ) |> arrange(pval)
+  # select the top 400 genes (based on blood data's feature selection section)
+  return(rownames(rank)[1:400])
+}
+```
+
+#### Biopsy
+
+```{r biopsy_de_func, warning = FALSE, message = FALSE  }
+# mutual information
+biopsy_de = function(eMat_train, pData_train) {
+  # discretize the data
+  eMat_disc = discretize(eMat_train, dis = 'equalfreq')
+  # compute mutual information between each gene and the class labels
+  mi_scores = apply(eMat_disc, 1, function(gid) mutinformation(gid, pData_train$outcome))
+  # rank and select top features
+  genes = eMat_train |> rownames()
+  mi_result = data.frame(genes)
+  mi_result$score = mi_scores
+  mi_rank = mi_result |> arrange(desc(score))
+  return(mi_rank$genes[1:200])
+}
+```
+
+### \[Modelling\] Cross-validated pre-processing
+
+#### Blood
+
+```{r blood_model_preprocess_func, warning = FALSE, message = FALSE  }
+# function to ensure preprocessing are done uniformly for each selection method
+blood_preproc = function(eMat = X_train, pData = y_train, test_fold) {
+  # split train-test set
+  pData_train = pData |> filter(fold != test_fold)
+  pData_test = pData |> filter(fold == test_fold)
+  eMat_train = eMat[,pData_train$geo_accession]
+  eMat_test = eMat[,pData_test$geo_accession]
+  # batch correct test and train set
+  train_batched = ComBat(eMat_train, pData_train$original_dataset)
+  test_batched = ComBat(eMat_test, pData_test$original_dataset)
+  # normalize
+  norm = normalize(train = train_batched, test = test_batched)
+  train_normed = norm$train
+  test_normed = norm$test
+  # feature selection
+  de = blood_de(train_normed, pData_train)
+  train_de = train_normed[de,]
+  test_de = test_normed[de,]
+  return(list(x_train = train_de,
+              x_test = test_de,
+              y_train = pData_train,
+              y_test = pData_test))
+}
+```
+
+#### Biopsy
+
+```{r biopsy_model_preprocess_func, warning = FALSE, message = FALSE  }
+# function to ensure preprocessing are done uniformly for each selection method
+biopsy_preproc = function(eMat = X_train, pData = y_train, test_fold) {
+  # split train-test set
+  pData_train = pData |> filter(fold != test_fold)
+  pData_test = pData |> filter(fold == test_fold)
+  eMat_train = eMat[,pData_train$geo_accession]
+  eMat_test = eMat[,pData_test$geo_accession]
+  # batch correct test and train set
+  train_batched = ComBat(eMat_train, pData_train$original_dataset)
+  test_batched = ComBat(eMat_test, pData_test$original_dataset)
+  # normalize
+  norm = normalize(train = train_batched, test = test_batched)
+  train_normed = norm$train
+  test_normed = norm$test
+  # feature selection
+  de = biopsy_de(train_normed, pData_train)
+  train_de = train_normed[de,]
+  test_de = test_normed[de,]
+  return(list(x_train = train_de,
+              x_test = test_de,
+              y_train = pData_train,
+              y_test = pData_test))
+}
+```
+
+### \[Modelling\] F2 score calculation
+
+$$
+F_2 = \frac{5 \times \text{precision} \times \text{recall}}{4 \times\text{precision} + \text{recall}}
+$$
+
+```{r f2_func, warning = FALSE, message = FALSE  }
+f2 = function(pred_class, pData) {
+  # create a confusion matrix from the predicted and actual outcomes
+  conf_mat = confusionMatrix(data = pred_class, reference = pData$outcome,
+                             positive = 'reject')
+  # extract recall and precision rate
+  recall = conf_mat$byClass['Recall']
+  precision = conf_mat$byClass['Precision']
+  # calculate F2 score based on the given formula
+  return((5*precision*recall)/(4*precision+recall))
+}
+```
+
+# Blood Data
+
+## Data Cleaning
+
+### GSE51675
+
+**Originally:**
+
+-   18 patients
+
+-   41,093 genes
+
+```{r GSE51675, warning = FALSE, message = FALSE  }
+GSE51675 = getGEO('GSE51675', GSEMatrix = TRUE)
+GSE51675 = GSE51675[[1]]
+```
+
+#### pData
+
+-   9 rejected patients
+
+-   9 stable patients
+
+```{r pGSE51675, warning = FALSE, message = FALSE  }
+# retrieve phenotype data
+pGSE51675 = pData(GSE51675)
+# remove uninformed columns
+pGSE51675 = pGSE51675 |> remove_constant()
+# decide on stable-reject status of patients
+pGSE51675$outcome = ifelse(str_detect(pGSE51675$`disease state:ch1`,'reject'),
+                           'reject', 'stable') |> 
+  factor(levels = c('stable', 'reject'))
+# retain only patients' id and outcome
+pGSE51675 = pGSE51675 |> select(c(geo_accession, outcome))
+```
+
+#### fData
+
+```{r fGSE51675, warning = FALSE, message = FALSE  }
+# retrieve the feature data
+fGSE51675 = fData(GSE51675)
+# exclude every uninformed columns and rows with no gene symbol
+fGSE51675 = fGSE51675 |> remove_constant() |> filter(GENE_SYMBOL != '')
+# change the column name of gene symbol column to be consistent with other cleaned datasets
+fGSE51675$gene_symbols = fGSE51675$GENE_SYMBOL
+# retain only gene id and symbol
+fGSE51675 = fGSE51675 |> select(c(ID, gene_symbols))
+```
+
+#### eMat
+
+**After cleaning:**
+
+-   18 patients
+
+-   19,595 genes
+
+```{r eGSE51675, warning = FALSE, message = FALSE  }
+# retrieve the gene expression matrix
+eGSE51675 = exprs(GSE51675)
+# retain only the genes and patients explainable by the fdata and the pdata
+eGSE51675 = eGSE51675[rownames(fGSE51675), rownames(pGSE51675)]
+# remove constant gene expressions
+eGSE51675 = eGSE51675[apply(eGSE51675, 1, 
+                            function(x) length(unique(x)) > 1),]
+# run limma to get significant values for the duplicated symbols
+eGSE51675 = limma_duplicates(eGSE51675, fGSE51675, pGSE51675)
+```
+
+### GSE15296
+
+**Originally:**
+
+-   75 patients
+
+-   54,675 genes
+
+```{r GSE15296, warning = FALSE, message = FALSE  }
+GSE15296 = getGEO('GSE15296', GSEMatrix = TRUE)
+GSE15296 = GSE15296[[1]]
+```
+
+#### pData
+
+-   51 rejected patients
+
+-   24 stable patients
+
+```{r pGSE15296, warning = FALSE, message = FALSE  }
+# obtain patients' data
+pGSE15296 = pData(GSE15296)
+# remove uninformed columns
+pGSE15296 = pGSE15296 |> remove_constant()
+# decide the reject-stable status of patients
+pGSE15296$outcome = ifelse(str_detect(pGSE15296$`phenotype:ch1`, 'Rejection'),
+                           'reject', 'stable') |>
+  factor(levels = c('stable', 'reject'))
+# retain only patients' ID and their allograft outcome
+pGSE15296 = pGSE15296 |> select(geo_accession, outcome)
+```
+
+#### fData
+
+```{r fGSE15296, warning = FALSE, message = FALSE  }
+# obtain information of the recorded genes
+fGSE15296 = fData(GSE15296)
+# remove uninformed rows and columns
+fGSE15296 = fGSE15296 |> remove_constant() |> filter(`Gene Symbol` != '')
+# retain the 1st listed gene symbol for each observation
+fGSE15296$gene_symbols = str_split(fGSE15296$`Gene Symbol`, '///') |> 
+  sapply(function(x) str_trim(x[1]))
+# retain only genes' symbols and IDs
+fGSE15296 = fGSE15296 |> select(c(ID, gene_symbols))
+```
+
+#### eMat
+
+**After cleaning:**
+
+-   75 patients
+
+-   22,880 genes
+
+```{r eGSE15296, warning = FALSE, message = FALSE  }
+# obtain the expression matrix
+eGSE15296 = exprs(GSE15296)
+# only keep the patients and genes that are included in the pdata and fdata
+eGSE15296 = eGSE15296[rownames(fGSE15296), rownames(pGSE15296)]
+# remove constant gene expressions
+eGSE15296 = eGSE15296[apply(eGSE15296, 1, 
+                            function(x) length(unique(x)) > 1),]
+# run limma to remove duplications of gene symbols in the expression matrix
+eGSE15296 = limma_duplicates(eGSE15296, fGSE15296, pGSE15296)
+eGSE15296 = log2(eGSE15296 + 1)
+```
+
+### GSE46474
+
+**Originally:**
+
+-   40 patients
+
+-   54,613 genes
+
+```{r GSE46474, warning = FALSE, message = FALSE  }
+GSE46474 = getGEO('GSE46474', GSEMatrix = TRUE)
+GSE46474 = GSE46474[[1]]
+```
+
+#### pData
+
+-   20 rejected patients
+
+-   20 stable patients
+
+```{r pGSE46474, warning = FALSE, message = FALSE  }
+# obtain the patients' data
+pGSE46474 = pData(GSE46474)
+# remove uninformed columns and patients with undefined outcomes
+pGSE46474 = pGSE46474 |> remove_constant()
+# decide the allograft stable-reject status of each patient
+pGSE46474$outcome = ifelse(str_detect(pGSE46474$`procedure status:ch1`, 'NR'),
+                           'stable', 'reject') |> 
+  factor(levels = c('stable', 'reject'))
+# retain only patients' id and status
+pGSE46474 = pGSE46474 |> select(geo_accession, outcome)
+```
+
+#### fData
+
+```{r fGSE46474, warning = FALSE, message = FALSE  }
+# obtain the genes' information
+fGSE46474 = fData(GSE46474)
+# remove uninformed rows and columns
+fGSE46474 = fGSE46474 |> remove_constant() |> filter(`Gene Symbol` != '')
+# retain only the 1st listed symbol for each observation
+fGSE46474$gene_symbols = str_split(fGSE46474$`Gene Symbol`, '///') |> 
+  sapply(function(x) str_trim(x[1]))
+# retain only genes' ID and symbol
+fGSE46474 = fGSE46474 |> select(ID, gene_symbols)
+```
+
+#### eMat
+
+**After cleaning:**
+
+-   40 patients
+
+-   22,880 genes
+
+```{r eGSE46474, warning = FALSE, message = FALSE  }
+# obtain the expression matrix data
+eGSE46474 = exprs(GSE46474)
+# filter out the genes and patients not included in the pdata and the fdata
+eGSE46474 = eGSE46474[rownames(fGSE46474), rownames(pGSE46474)]
+# remove constant gene expressions
+eGSE46474 = eGSE46474[apply(eGSE46474, 1, 
+                            function(x) length(unique(x)) > 1),]
+# remove gene symbols duplicates using limma
+eGSE46474 = limma_duplicates(eGSE46474, fGSE46474, pGSE46474)
+```
+
+### GSE1563
+
+**Originally:**
+
+-   62 patients
+
+-   12,625 genes
+
+```{r GSE1563, warning = FALSE, message = FALSE  }
+GSE1563 = getGEO('GSE1563', GSEMatrix = TRUE)
+GSE1563 = GSE1563[[1]]
+```
+
+#### pData
+
+-   6 rejected patients
+
+-   8 stable patients
+
+```{r pGSE1563_blood, warning = FALSE, message = FALSE  }
+# obtain patients' data
+pGSE1563_both = pData(GSE1563)
+# remove uninformed rows and columns
+pGSE1563_both = pGSE1563_both |> remove_constant() |> 
+  filter(!str_detect(description.4, 'none'))
+# decide the allograft status for each patients
+pGSE1563_both$outcome = ifelse(
+  str_detect(pGSE1563_both$description, 'acute rejection'), 'reject', 'stable') |> 
+  factor(levels = c('stable', 'reject'))
+# extract samples with blood test result
+pGSE1563 = pGSE1563_both |> filter(source_name_ch1 == 'PBL')
+# retain patients' IDs and outcomes
+pGSE1563 = pGSE1563 |> select(geo_accession, outcome)
+```
+
+#### fData
+
+```{r fGSE1563, warning = FALSE, message = FALSE  }
+# obtain the genes' information
+fGSE1563 = fData(GSE1563)
+# remove uninformed rows and columns
+fGSE1563 = fGSE1563 |> remove_constant() |> filter(`Gene Symbol` != '')
+# retain only the 1st listed gene symbol
+fGSE1563$gene_symbols = str_split(fGSE1563$`Gene Symbol`, '///') |> 
+  sapply(function(x) str_trim(x[1]))
+# only keep the genes' IDs and symbols
+fGSE1563 = fGSE1563 |> select(c(ID, gene_symbols))
+```
+
+#### eMat
+
+**After cleaning:**
+
+-   14 patients
+
+-   9,085 genes
+
+```{r eGSE1563_blood, warning = FALSE, message = FALSE  }
+eGSE1563_both = exprs(GSE1563)
+# retain only observations of genes included in the fdata from blood samples
+eGSE1563 = eGSE1563_both[rownames(fGSE1563), rownames(pGSE1563)]
+# remove constant gene expressions
+eGSE1563 = eGSE1563[apply(eGSE1563, 1, 
+                            function(x) length(unique(x)) > 1),]
+# run limma to remove duplicated gene symbols
+eGSE1563 = limma_duplicates(eGSE1563, fGSE1563, pGSE1563)
+eGSE1563 = log2(eGSE1563 + 1)
+```
+
+### GSE20300
+
+**Originally:**
+
+-   24 patients
+-   54,675 genes
+
+```{r GSE20300, warning = FALSE, message = FALSE  }
+GSE20300 = getGEO('GSE20300', GSEMatrix = TRUE)
+GSE20300 = GSE20300[[1]]
+```
+
+#### pData
+
+-   15 rejected patients
+
+-   9 stable patients
+
+```{r pGSE20300, warning = FALSE, message = FALSE  }
+# obtain patients' data
+pGSE20300 = pData(GSE20300)
+# remove uninformed rows and columns
+pGSE20300 = pGSE20300 |> remove_constant()
+# decide the allograft outcome of each patient
+pGSE20300$outcome = ifelse(pGSE20300$`transplant state:ch1` == 'Stable',
+                           'stable', 'reject') |> 
+  factor(levels = c('stable', 'reject'))
+# keep only patients' IDs and outcomes
+pGSE20300 = pGSE20300 |> select(geo_accession, outcome)
+```
+
+#### fData
+
+```{r fGSE20300, warning = FALSE, message = FALSE  }
+# obtain the genes' data
+fGSE20300 = fData(GSE20300)
+# remove uninformed rows and columns
+fGSE20300 = fGSE20300 |> remove_constant() |> filter(`Gene Symbol` != '')
+# retain only the 1st listed gene symbol
+fGSE20300$gene_symbols = str_split(fGSE20300$`Gene Symbol`, '///') |> 
+  sapply(function(x) str_trim(x[1]))
+# keep only genes' IDs and symbols
+fGSE20300 = fGSE20300 |> select(c(ID, gene_symbols))
+```
+
+#### eMat
+
+**After cleaning:**
+
+-   24 patients
+
+-   22,165 genes
+
+```{r eGSE20300, warning = FALSE, message = FALSE  }
+# obtain the expression matrix
+eGSE20300 = exprs(GSE20300)
+# filter out the genes and patients not included in the fdata and the pdata
+eGSE20300 = eGSE20300[rownames(fGSE20300), rownames(pGSE20300)]
+# remove constant gene expressions
+eGSE20300 = eGSE20300[apply(eGSE20300, 1, 
+                            function(x) length(unique(x)) > 1),]
+fGSE20300 = fGSE20300[rownames(eGSE20300),]
+# run limma to remove duplicated gene symbols
+eGSE20300 = limma_duplicates(eGSE20300, fGSE20300, pGSE20300)
+```
+
+### GSE22707
+
+**Originally:**
+
+-   72 patients
+
+-   54,675 genes
+
+```{r GSE22707, warning = FALSE, message = FALSE  }
+GSE22707 = getGEO('GSE22707', GSEMatrix = TRUE)
+GSE22707 = GSE22707[[1]]
+```
+
+#### pData
+
+-   24 rejected patients
+
+-   36 stable patients
+
+```{r pGSE22707, warning = FALSE, message = FALSE  }
+# obtain the patients' data
+pGSE22707 = pData(GSE22707)
+# remove uninformed rows and columns
+pGSE22707 = pGSE22707 |> remove_constant() |> 
+  filter(`outcome:ch1` != 'healthy volunteers')
+# decide the stable-reject outcome for each patient
+pGSE22707$outcome = ifelse(str_detect(pGSE22707$`outcome:ch1`, 'stable'),
+                           'stable', 'reject') |> 
+  factor(levels = c('stable', 'reject'))
+# retain only patients' IDs and outcomes
+pGSE22707 = pGSE22707 |> select(c(geo_accession, outcome))
+```
+
+#### fData
+
+```{r fGSE22707, warning = FALSE, message = FALSE  }
+# obtain the genes' data
+fGSE22707 = fData(GSE22707)
+# remove uninformed columns and rows
+fGSE22707 = fGSE22707 |> remove_constant() |> 
+  filter(`Gene Title` != '')
+# retain only the 1st listed gene symbol
+fGSE22707$gene_symbols = str_split(fGSE22707$`Gene Symbol`,'///') |> 
+  sapply(function(x) str_trim(x[1]))
+# keep only genes' IDs and symbols
+fGSE22707 = fGSE22707 |> select(c(ID, gene_symbols))
+```
+
+#### eMat
+
+**After cleaning:**
+
+-   60 patients
+
+-   21,860 genes
+
+```{r eGSE22707, warning = FALSE, message = FALSE  }
+# obtain the expression matrix
+eGSE22707 = exprs(GSE22707)
+# filter out the genes and samples not included in the fdata and the pdata
+eGSE22707 = eGSE22707[rownames(fGSE22707), rownames(pGSE22707)]
+# remove constant gene expressions
+eGSE22707 = eGSE22707[apply(eGSE22707, 1, 
+                            function(x) length(unique(x)) > 1),]
+# run limma to get rid of duplicated gene symbols
+eGSE22707 = limma_duplicates(eGSE22707, fGSE22707, pGSE22707)
+```
+
+### GSE50084
+
+**Originally**
+
+-   115 patients
+
+-   29,096 genes
+
+```{r GSE50084, warning = FALSE, message = FALSE  }
+GSE50084 = getGEO('GSE50084', GSEMatrix = TRUE)
+GSE50084 = GSE50084[[1]]
+```
+
+#### pData
+
+-   28 rejected patients
+
+-   26 stable patients
+
+```{r pGSE50084_blood, warning = FALSE, message = FALSE }
+# obtain patients' information
+pGSE50084_both = pData(GSE50084)
+# filter out uninformed columns and rows
+pGSE50084_both = pGSE50084_both |> remove_constant()
+# decide patients' reject-stable status
+pGSE50084_both$outcome = ifelse(str_detect(pGSE50084_both$source_name_ch1, 'reject'),
+                           'reject', 'stable') |> 
+  factor(levels = c('stable', 'reject'))
+# separate the blood samples from the biopsy samples
+pGSE50084 = pGSE50084_both |> filter(`tissue:ch1` == 'blood') |> 
+  select(c(geo_accession, outcome))
+```
+
+#### fData
+
+```{r fGSE50084, warning = FALSE, message = FALSE }
+# obtain genes' data
+fGSE50084 = fData(GSE50084)
+# filter out uninformed rows and columns
+fGSE50084 = fGSE50084 |> remove_constant() |> 
+  filter(gene_assignment != '---')
+# retain 1 gene symbol in the gene assignment column
+fGSE50084$gene_symbols = str_split(fGSE50084$gene_assignment, '//') |> 
+  sapply(function(x) str_trim(x[2]))
+# keep only the genes' IDs and symbols
+fGSE50084 = fGSE50084 |> select(c(ID, gene_symbols))
+```
+
+#### eMat
+
+**After cleaning:**
+
+-   54 patients
+
+-   23,307 genes
+
+```{r eGSE50084_blood, warning = FALSE, message = FALSE }
+eGSE50084_both = exprs(GSE50084)
+# filter out genes not recorded in fdata and samples not from blood test
+eGSE50084 = eGSE50084_both[rownames(fGSE50084), rownames(pGSE50084)]
+# remove constant gene expressions
+eGSE50084 = eGSE50084[apply(eGSE50084, 1, 
+                            function(x) length(unique(x)) > 1),]
+# run limma to get rid of duplicated gene symbols
+eGSE50084 = limma_duplicates(eGSE50084, fGSE50084, pGSE50084)
+```
+
+## Data Merging
+
+-   `GSE50084` was randomly chosen as the left-out test set
+
+### Decision making with fewer-gene datasets
+
+#### Desirable genes to retain
+
+```{r blood_retained_genes, warning = FALSE, message = FALSE }
+# extract outcome for the merge of the 4 datasets whose gene numbers are fairly similar
+outcome_retained = c(pGSE15296$outcome,
+                     pGSE20300$outcome,
+                     pGSE22707$outcome,
+                     pGSE50084$outcome) |>
+  factor(levels = c('stable', 'reject'))
+# find the common genes across the 4 datasets
+common_genes_retained = intersect(rownames(eGSE15296), 
+                                  rownames(eGSE20300))
+common_genes_retained = intersect(common_genes_retained, 
+                                  rownames(eGSE22707))
+common_genes_retained = intersect(common_genes_retained, 
+                         rownames(eGSE50084))
+# retain only the common genes in each individual dataset
+eGSE15296_subset_retained = eGSE15296[which(
+  rownames(eGSE15296) %in% common_genes_retained),]
+eGSE20300_subset_retained = eGSE20300[which(
+  rownames(eGSE20300) %in% common_genes_retained),]
+eGSE22707_subset_retained = eGSE22707[which(
+  rownames(eGSE22707) %in% common_genes_retained),]
+eGSE50084_subset_retained = eGSE50084[which(
+  rownames(eGSE50084) %in% common_genes_retained),]
+# order the individual expression matrices so that they are in the same order regarding gene symbols
+eGSE15296_ordered_retained = eGSE15296_subset_retained[match(
+  common_genes_retained, rownames(eGSE15296_subset_retained)),]
+eGSE20300_ordered_retained = eGSE20300_subset_retained[match(
+  common_genes_retained, rownames(eGSE20300_subset_retained)),]
+eGSE22707_ordered_retained = eGSE22707_subset_retained[match(
+  common_genes_retained, rownames(eGSE22707_subset_retained)),]
+eGSE50084_ordered_retained = eGSE50084_subset_retained[match(
+  common_genes_retained, rownames(eGSE50084_subset_retained)),]
+# merge the 4 datasets naively
+eMat_noBatch_retained = cbind(eGSE15296_ordered_retained,
+                              eGSE20300_ordered_retained,
+                              eGSE22707_ordered_retained,
+                              eGSE50084_ordered_retained)
+# batch factor
+batch_retained = c(rep(1, nrow(pGSE15296)),
+                   rep(2, nrow(pGSE20300)),
+                   rep(3,nrow(pGSE22707)),
+                   rep(4, nrow(pGSE50084)))
+# batch correction
+eMat_retained = ComBat(eMat_noBatch_retained, batch_retained)
+# run limma
+design = model.matrix(~outcome_retained)
+fit = lmFit(eMat_retained, design) |> eBayes()
+# extract statistically differential genes whose adj.P.Val < 0.01
+significant_genes = topTable(fit, n = Inf) |> filter(adj.P.Val < 0.01)
+```
+
+#### Consider GSE46474
+
+```{r GSE46474_percent_retained, warning = FALSE, message = FALSE }
+# check how many of the above significant genes are included
+sum(rownames(significant_genes) %in% rownames(eGSE46474))/nrow(significant_genes)
+```
+
+-   All the desirable genes concluded above are included in `GSE46474`
+
+$\Rightarrow$ Including `GSE46474` in the merge would not drop any statistically differential genes
+
+$\Rightarrow$ Retain `GSE46474` in the merge
+
+### Train set
+
+#### `y_train` *(merged pData)*
+
+##### Merge
+
+```{r blood_y_train, warning = FALSE, message = FALSE }
+# merge the pData of all except from the test set GSE50084 
+y_train = rbind(pGSE15296, pGSE20300)
+y_train = rbind(y_train, pGSE22707)
+y_train = rbind(y_train, pGSE46474)
+y_train = rbind(y_train, pGSE1563)
+# contain additional information about the data source of each sample
+y_train$original_dataset = c(rep('GSE15296', nrow(pGSE15296)),
+                           rep('GSE20300', nrow(pGSE20300)),
+                           rep('GSE22707', nrow(pGSE22707)),
+                           rep('GSE46474', nrow(pGSE46474)),
+                           rep('GSE1563', nrow(pGSE1563)))
+```
+
+##### Split into folds for cross validation
+
+```{r blood_cross_validate_folds, warning = FALSE, message = FALSE }
+datasets = y_train$original_dataset |> unique()
+folds_number = 5
+y_train$fold = character(length = nrow(y_train))
+row.names(y_train) = c(1:nrow(y_train))
+row_tracker = 0
+# this loop ensures that 
+  ## (1) each fold contains a similar number of samples from each individual dataset
+  ## (2) within each dataset, the class distribution is balanced across the folds
+for (i in 1:length(datasets)) {
+  X_ind = y_train |> filter(original_dataset == datasets[i])
+  folds = caret::createFolds(X_ind$outcome, k = folds_number,
+                      returnTrain = FALSE)
+  for (j in 1:length(folds)) {
+    y_train$fold[folds[[j]] + row_tracker] = j
+  }
+  row_tracker = row_tracker + nrow(X_ind)
+}
+y_train$fold = factor(y_train$fold)
+```
+
+#### `X_train` *(merged eMat)*
+
+##### Without Batch correction
+
+```{r blood_eMat_no_batch, warning = FALSE, message = FALSE }
+# get a list of genes that all datasets have
+common_genes = intersect(rownames(eGSE15296), rownames(eGSE20300))
+common_genes = intersect(common_genes, rownames(eGSE22707))
+common_genes = intersect(common_genes, rownames(eGSE46474))
+common_genes = intersect(common_genes, rownames(eGSE50084))
+common_genes = intersect(common_genes, rownames(eGSE1563))
+# retain only the genes that all datasets have in each individual dataset
+eGSE15296_subset = eGSE15296[which(
+  rownames(eGSE15296) %in% common_genes), ]
+eGSE20300_subset = eGSE20300[which(
+  rownames(eGSE20300) %in% common_genes), ]
+eGSE22707_subset = eGSE22707[which(
+  rownames(eGSE22707) %in% common_genes), ]
+eGSE46474_subset = eGSE46474[which(
+  rownames(eGSE46474) %in% common_genes), ]
+eGSE1563_subset = eGSE1563[which(
+  rownames(eGSE1563) %in% common_genes), ]
+# order the individual expression matrices so that they are in the same order regarding gene symbols
+eGSE15296_ordered = eGSE15296_subset[match(
+  common_genes, rownames(eGSE15296_subset)), ]
+eGSE20300_ordered = eGSE20300_subset[match(
+  common_genes, rownames(eGSE20300_subset)), ]
+eGSE22707_ordered = eGSE22707_subset[match(
+  common_genes, rownames(eGSE22707_subset)), ]
+eGSE46474_ordered = eGSE46474_subset[match(
+  common_genes, rownames(eGSE46474_subset)), ]
+eGSE1563_ordered = eGSE1563_subset[match(
+  common_genes, rownames(eGSE1563_subset)), ]
+# merge everything without the batch effect
+X_train = cbind(eGSE15296_ordered,
+                     eGSE20300_ordered,
+                     eGSE22707_ordered,
+                     eGSE46474_ordered,
+                     eGSE1563_ordered
+                     )
+# pca graph of the merged dataset without combat, colouring by original dataset
+pca = prcomp(t(X_train), center = TRUE, scale. = TRUE)
+p1 = pca$x |> 
+  data.frame() |> 
+  mutate(dataset = c(rep('GSE15296', nrow(pGSE15296)),
+                     rep('GSE20300', nrow(pGSE20300)),
+                     rep('GSE22707', nrow(pGSE22707)),
+                     rep('GSE46474', nrow(pGSE46474)),
+                     rep('GSE1563', nrow(pGSE1563))
+                     )) |> 
+  ggplot(aes(x = PC1, y = PC2, color = dataset)) +
+  geom_point(size = 3) + theme_bw()
+```
+
+##### With Batch correction
+
+```{r blood_eMat_batch, warning = FALSE, message = FALSE }
+# number each sample by the dataset they come from
+batch = c(rep(1, ncol(eGSE15296)),
+          rep(3, ncol(eGSE20300)),
+          rep(4, ncol(eGSE22707)),
+          rep(5, ncol(eGSE46474)),
+          rep(6, ncol(eGSE1563)))
+# merge the dataset with batch effect fixing
+X_train_batched = ComBat(dat = X_train,
+                    batch = batch,
+                    mod = NULL,
+                    par.prior = TRUE,
+                    prior.plots = FALSE)
+# graph pca for batch effect visualized
+pca_combat = prcomp(t(X_train_batched), center = TRUE, scale. = TRUE)
+p2 = pca_combat$x |> 
+  data.frame() |> 
+  mutate(dataset = c(rep('GSE15296', nrow(pGSE15296)),
+                     rep('GSE20300', nrow(pGSE20300)),
+                     rep('GSE22707', nrow(pGSE22707)),
+                     rep('GSE46474', nrow(pGSE46474)),
+                     rep('GSE1563', nrow(pGSE1563))
+                     )) |>
+  ggplot(aes(x = PC1, y = PC2, color = dataset)) +
+  geom_point(size = 3) + theme_bw()
+```
+
+##### Batch correction effect
+
+```{r blood_batch_effect, warning = FALSE, message = FALSE }
+ggarrange(p1, p2, labels = c('A', 'B'),
+          ncol = 2, nrow = 1,
+          common.legend = TRUE, legend = 'bottom')
+```
+
+#### Overview
+
+-   213 patients
+
+    -   116 rejected patients
+
+    -   97 stable patients
+
+-   8,557 genes
+
+### Test set
+
+#### `y_test` *(test set pData)*
+
+```{r blood_y_test, warning = FALSE, message = FALSE }
+y_test = pGSE50084
+```
+
+#### `X_test` *(test set eMat)*
+
+```{r blood_x_test, warning = FALSE, message = FALSE }
+# exclude any genes that are not included in the train data
+X_test = eGSE50084[which(rownames(eGSE50084) %in% common_genes),]
+# rearrange to match the gene order of the train data
+X_test = X_test[match(common_genes, rownames(X_test)),]
+```
+
+#### Overview
+
+-   54 patients
+
+    -   28 rejected patients
+
+    -   26 stable patients
+
+-   8,557 genes
+
+## Feature Selection
+
+```{r blood_best_fs_frame, warning = FALSE, message = FALSE }
+# a data frame to store the performance of the models after hyper parameters are fine tuned
+best_avg_perf = vector('list', length = 7)
+```
+
+### Limma
+
+```{r blood_limma, warning = FALSE, message = FALSE }
+# the number of significant genes to choose from
+n_vals = c(10, 25, 50, 75, 100, 150, 200, 250, 300, 400, 500)
+limma_perf = vector('list', length = 5 * length(n_vals))
+index = 1
+# create a loop for cross validation
+for (i in c(1:5)) {
+  # preprocess
+  preproc = fs_preproc(test_fold = i)
+  cv_x_train = preproc$x_train
+  cv_x_test = preproc$x_test
+  cv_y_train = preproc$y_train
+  cv_y_test = preproc$y_test
+  # feature selection (limma in this example)
+  design = model.matrix(~cv_y_train$outcome)
+  fit = lmFit(cv_x_train, design) |> eBayes()
+  rank = topTable(fit, n = Inf)
+  # loop through each possible n values
+  for (n in n_vals){
+    # select n top genes
+    de = rownames(rank)[1:n]
+    # include only n top genes in the training and the test fold
+    cv_train_reduced = cv_x_train[de,]
+    cv_test_reduced = cv_x_test[de,]
+    # random forest built on training fold
+    rf = randomForest(x = t(cv_train_reduced), y = cv_y_train$outcome)
+    # evaluate model performance on the test fold
+    pred_prob = predict(rf, t(cv_test_reduced), type = 'prob')[, 'reject']
+    pred_class = ifelse(pred_prob > 0.5, 'reject', 'stable') |> 
+      factor(levels = c('stable', 'reject'))
+    # roc object to calculate auc
+    roc_obj = roc(response = cv_y_test$outcome, predictor = pred_prob)
+    # extract model performance and store it in the comparison table
+    limma_perf[[index]] = data.frame(gene_number = n,
+                                     auc = auc(roc_obj) |> as.numeric())
+    index = index + 1
+  }
+}
+# calculate the overall performance of each n value
+limma_perf = limma_perf |> bind_rows() |> drop_na()
+limma_rank = limma_perf |> 
+  group_by(gene_number) |> 
+  summarise(mean_auc = mean(auc)) |> 
+  arrange(desc(mean_auc))
+# visualize the performance of each n
+limma_rank_long = limma_rank |> 
+  pivot_longer(cols = mean_auc, names_to = 'metric', values_to = 'value')
+(ggplot(data = limma_rank_long, 
+        aes(x = gene_number, y = value)) +
+    geom_line() + 
+    labs(x = 'Number of genes', y = 'Area Under the Curve (AUC)', title = 'Performance of Limma with different numbers of genes on Blood data') + 
+    theme_bw()) |> 
+  ggplotly()
+limma_rank |> datatable(colnames = c('Gene number', 'Mean AUC'))
+# optimal n
+best_avg_perf[[1]] = data.frame(method = rep('Limma', 5),
+                                limma_perf |> 
+                                  filter(gene_number == 300))
+```
+
+### Mutual Information
+
+```{r blood_mutual_information, warning = FALSE, message = FALSE  }
+# storage for performance per cross validation
+mi_perf = vector('list', length = 5 * length(n_vals))
+index = 1
+# create a loop for cross validation
+for (i in c(1:5)) {
+  preproc = fs_preproc(test_fold = i)
+  cv_x_train = preproc$x_train
+  cv_x_test = preproc$x_test
+  cv_y_train = preproc$y_train
+  cv_y_test = preproc$y_test
+  # rank genes based on their mi score
+  rank = mi_score(cv_x_train, cv_y_train)
+  # loop through each possible n values
+  for (n in n_vals){
+    # select n top genes
+    de = rank[1:n]
+    # include only n top genes in the training and the test fold
+    cv_x_train_reduced = cv_x_train[de,]
+    cv_x_test_reduced = cv_x_test[de,]
+    # random forest built on training fold
+    rf = randomForest(x = t(cv_x_train_reduced), y = cv_y_train$outcome)
+    # evaluate model performance on the test fold
+    pred_prob = predict(rf, t(cv_x_test_reduced), type = 'prob')[,'reject']
+    roc_obj = roc(response = cv_y_test$outcome, predictor = pred_prob)
+    # extract model performance and store it in the comparison table
+    mi_perf[[index]] = data.frame(gene_number = n,
+                                  auc = auc(roc_obj) |> as.numeric())
+    index = index + 1
+  }
+}
+# calculate the overall performance of each n value
+mi_perf = mi_perf |> bind_rows() |> drop_na()
+mi_rank = mi_perf |>  
+  group_by(gene_number) |> 
+  summarise(mean_auc = mean(auc)) |> 
+  arrange(desc(mean_auc))
+# visualize the performance of each n
+mi_rank_long = mi_rank |> 
+  pivot_longer(cols = mean_auc, names_to = 'metric', values_to = 'value')
+(ggplot(data = mi_rank_long, aes(x = gene_number, y = value)) +
+    geom_line() + 
+    labs(x = 'Gene number', y = 'Area Under the Curve (AUC)', title = 'Performance of Mutual Information with different numbers of genes on Blood data') + 
+    theme_bw()) |> 
+  ggplotly()
+mi_rank |> datatable(colnames = c('Gene number', 'Mean AUC'))
+# save the optimal n value
+best_avg_perf[[2]] = data.frame(
+  method = rep('MI', 5),
+  mi_perf |> filter(gene_number == 500))
+```
+
+### Fisher score
+
+```{r blood_fisher_score, warning = FALSE, message = FALSE  }
+fisher_perf = vector('list', length = 5 * length(n_vals))
+index = 1
+# loop to do cross validation
+for (i in c(1:5)) {
+  preproc = fs_preproc(test_fold = i)
+  cv_x_train = preproc$x_train
+  cv_x_test = preproc$x_test
+  cv_y_train = preproc$y_train
+  cv_y_test = preproc$y_test
+  fisher_scores = fisher_score(cv_x_train %>% as.matrix(), cv_y_train)
+  # calculate fisher scores from the train folds
+  rank = fisher_scores |> rownames()
+  for (n in n_vals) {
+    # select top n genes
+    de = rank[1:n]
+    cv_train_reduced = cv_x_train[de,]
+    cv_test_reduced = cv_x_test[de,]
+    # build a random forest to evaluate performance
+    rf = randomForest(t(cv_train_reduced), cv_y_train$outcome)
+    pred_prob = predict(rf, t(cv_test_reduced), type = 'prob')[,'reject']
+    roc_obj = roc(response = cv_y_test$outcome, predictor = pred_prob)
+    # extract the recall rate
+    fisher_perf[[index]] = data.frame(gene_number = n,
+                                      auc = auc(roc_obj) |> as.numeric())
+    index = index + 1
+  }
+}
+# calculate the overall performance of each n value
+fisher_perf = fisher_perf |> bind_rows() |> drop_na()
+fisher_rank = fisher_perf |> 
+  group_by(gene_number) |> 
+  summarise(mean_auc = mean(auc)) |> 
+  arrange(desc(mean_auc))
+# visualize the performance of each n
+fisher_rank_long = fisher_rank |> 
+  pivot_longer(cols = mean_auc, names_to = 'metric', values_to = 'value')
+(ggplot(data = fisher_rank_long, aes(x = gene_number, y = value)) +
+    geom_line() + 
+    labs(x = 'Gene number', y = 'Area Under the Curve (AUC)', title = 'Performance of Fisher score with different numbers of genes on Blood data') + 
+    theme_bw()) |> 
+  ggplotly()
+fisher_rank |> datatable(colnames = c('Gene number', 'Mean AUC'))
+# retain the best performing n value
+best_avg_perf[[4]] = data.frame(
+  method = rep('Fisher', 5), 
+  fisher_perf |> filter(gene_number == 500))
+```
+
+### T-test
+
+```{r blood_t_test, warning = FALSE, message = FALSE  }
+t_test_perf = vector('list', length = 5 * length(n_vals))
+index = 1
+# loop for cross validation
+for (i in c(1:5)) {
+  # train-test folds split
+  preproc = fs_preproc(test_fold = i)
+  cv_x_train = preproc$x_train
+  cv_x_test = preproc$x_test
+  cv_y_train = preproc$y_train
+  cv_y_test = preproc$y_test
+  # perform t test for each gene
+  t_test = apply(cv_x_train, 1, function(gene) {
+    t.test(gene~cv_y_train$outcome)$p.value
+  })
+  # rank the gene based on their p-value
+  rank = data.frame(
+    row.names = rownames(cv_x_train),
+    pval = t_test
+  ) |> arrange(pval)
+  # loop to find the optimal number of significant genes
+  for (n in n_vals) {
+    # select the top n genes
+    de = rownames(rank)[1:n]
+    cv_train_reduced = cv_x_train[de,]
+    cv_test_reduced = cv_x_test[de,]
+    # random forest to evaluate the feature selection method
+    rf = randomForest(t(cv_train_reduced), cv_y_train$outcome)
+    pred_prob = predict(rf, t(cv_test_reduced), type = 'prob')[,'reject']
+    roc_obj = roc(response = cv_y_test$outcome, predictor = pred_prob)
+    # extract the recall rate
+    t_test_perf[[index]] = data.frame(gene_number = n,
+                                      auc = auc(roc_obj) |> as.numeric())
+    index = index + 1
+  }
+}
+# calculate the overall performance of each n value
+t_test_perf = t_test_perf |> bind_rows() |> drop_na()
+t_test_rank = t_test_perf |> 
+  group_by(gene_number) |> 
+  summarise(mean_auc = mean(auc)) |> 
+  arrange(desc(mean_auc))
+# visualize the performance of each n
+t_test_rank_long = t_test_rank |> 
+  pivot_longer(cols = mean_auc, names_to = 'metric', values_to = 'value')
+(ggplot(data = t_test_rank_long, aes(x = gene_number, y = value)) +
+    geom_line() + 
+    labs(x = 'Gene number', y = 'Area Under the Curve (AUC)', title = 'Performance of T-test with different number of genes on Blood data') + 
+    theme_bw()) |> 
+  ggplotly()
+t_test_rank |> datatable(colnames = c('Gene number', 'Mean AUC'))
+# retain the best performing n value
+best_avg_perf[[5]] = data.frame(
+  method = rep('T-test', 5),
+  t_test_perf |> filter(gene_number == 400))
+```
+
+### Significance Analysis of Microarrays (SAM)
+
+```{r blood_sam, warning = FALSE, message = FALSE  }
+sam_perf = vector('list', length = 5 * length(n_vals))
+index = 1
+# loop to perform cross validation
+for (i in c(1:5)) {
+  # train-test folds split
+  preproc = fs_preproc(test_fold = i)
+  cv_x_train = preproc$x_train
+  cv_x_test = preproc$x_test
+  cv_y_train = preproc$y_train
+  cv_y_test = preproc$y_test
+  # turn outcome into binary values
+  bin_y_train = ifelse(cv_y_train$outcome == 'stable', 0, 1)
+  # run SAM for feature selection
+  sam_result = sam(cv_x_train, bin_y_train, 
+                   gene.names = rownames(cv_x_train))
+  sam_summary = summary(sam_result, delta = 0.5)
+  all_genes_sig = sam_summary@mat.sig
+  rank = all_genes_sig |> 
+    arrange((abs(d.value)))
+  # loop through possible number of significant genes
+  for (n in n_vals) {
+    if (n > nrow(rank)) {
+      break
+    }
+    # select the top n genes
+    de = rownames(rank)[1:n]
+    cv_train_reduced = cv_x_train[de,]
+    cv_test_reduced = cv_x_test[de,]
+    # random forest to evaluate method performance
+    rf = randomForest(t(cv_train_reduced), cv_y_train$outcome)
+    pred_prob = predict(rf, t(cv_test_reduced), type = 'prob')[,'reject']
+    roc_obj = roc(response = cv_y_test$outcome, predictor = pred_prob)
+    # extract the method sensitivity
+    sam_perf[[index]] = data.frame(gene_number = n, 
+                                   auc = auc(roc_obj) |> as.numeric())
+    index = index + 1
+  }
+}
+# calculate the overall performance of each n value
+sam_perf = sam_perf |> bind_rows() |> drop_na()
+sam_rank = sam_perf |> 
+  group_by(gene_number) |> 
+  summarise(mean_auc = mean(auc)) |> 
+  arrange(desc(mean_auc))
+# visualize the performance of each n
+sam_rank_long = sam_rank |> 
+  pivot_longer(cols = mean_auc, names_to = 'metric', values_to = 'value')
+(ggplot(data = sam_rank_long, aes(x = gene_number, y = value)) +
+    geom_line() + 
+    labs(x = 'Gene number', y = 'Area Under the Curve (AUC)', title = 'Performance of SAM with different numbers of genes on Blood data') + 
+    theme_bw()) |> 
+  ggplotly()
+sam_rank |> datatable(colnames = c('Gene number', 'Mean AUC'))
+# retain the best performing n value
+best_sam = sam_perf |> 
+  filter(gene_number == 250)
+best_avg_perf[[6]] = data.frame(method = rep('SAM', nrow(best_sam)),
+                                best_sam)
+```
+
+### Networks
+
+```{r blood_networks_ranking, warning = FALSE, message = FALSE  }
+# top 500 genes (in order) for the batch correction code listed below (not the actual final set of top 500 genes). in a list because its easier to copy paste from the jupyter notebook.
+genes_part_1 = c('SCN4A', 'CLDN14', 'CLCNKA', 'EFNA2', 'ADAMTSL2', 'PSG4', 'C8B', 'MFAP2', 'LALBA', 'CSF1', 'FOXG1', 'SLC6A7', 'GPR31', 'GNG12', 'RAC3', 'ST5', 'HRG', 'INSL4', 'PTPN3', 'CHAD', 'COL2A1', 'LBP', 'CX3CL1', 'ISLR', 'DPEP1', 'SLN', 'ITIH1', 'FEV', 'FOXD2', 'PPP1R3C', 'PRB4', 'PHYHIP', 'FOXN1', 'MAG', 'LY6G6C', 'PROP1', 'SSTR4', 'AGXT', 'RPS6KA4', 'SIX3', 'AMELY', 'MSI1', 'ANGPTL2', 'SCGB1D2', 'SLC9A3R2', 'GUCA2B', 'NEUROG3', 'LY6D', 'ASMT', 'TUBB2B', 'ITGA8', 'ARC', 'GRM4', 'EVPL', 'ROR2', 'MOXD1', 'SYN3', 'HMHB1', 'MYO16', 'TNN', 'MAPK8IP1', 'EML3', 'TBX1', 'NGFR', 'CELSR1', 'SERPINB7', 'SLC22A6', 'GUCY2F', 'IRX5', 'ASB4', 'SERPINA3', 'EDN2', 'SLC5A4', 'KCNH1', 'BRINP2', 'CHRD', 'UTF1', 'RHBDL1', 'CLDN4', 'AQP8', 'PTPRF', 'EN2', 'FKBP4', 'NKX2-2', 'SLC7A4', 'INHA', 'MYBPC1', 'H6PD', 'PLA2G1B', 'CNTN2', 'ITIH3', 'MC2R', 'ACVRL1', 'HTR2B', 'TM4SF5', 'KLK6', 'ARR3', 'PSCA', 'IRF6', 'INPP5J', 'MB', 'PRSS8', 'APOC2', 'CDC14B', 'GJB5', 'C1orf68', 'ZFR2', 'DKK1', 'SLCO2A1', 'WNT5A', 'P2RX3', 'GPR50', 'HCRTR1', 'SYNGR4', 'EMILIN1', 'SGCG', 'C4BPB', 'MUSK', 'MYL2', 'SERPIND1', 'IVL', 'ACTL6B', 'MMP24', 'KRT33A', 'TULP1', 'NR1I2', 'PDC', 'CCL25', 'FABP6', 'HTR1D', 'TLX2', 'HOXB6', 'KCNJ12', 'TREH', 'CCKBR', 'PLK1', 'CCL1', 'CYP4F11', 'SHH', 'FCN3', 'ABCA4', 'ELOVL2', 'IGLV6-57', 'PPL', 'HAO1', 'ACE', 'MT3', 'GPR12', 'OVOL1', 'ARSE', 'KCNV2', 'CYP17A1', 'AXL', 'FMO6P', 'C9', 'GUCY2D', 'NKX2-8', 'POLRMT', 'C11orf52', 'GABRE', 'ASIP', 'MYCLP1', 'FOXH1', 'SYN1', 'AFF3', 'CCL14', 'S100A7', 'HIST1H2BM', 'NPR3', 'FAM189A2', 'GPR17', 'HCRTR2', 'CSN2', 'CGB', 'FAT2', 'CAMK1G', 'AANAT', 'TNNT3', 'FOXI1', 'ACTN3', 'MXRA8', 'TCP10', 'CYP2C8', 'LOR', 'OR7E24', 'SLC28A1', 'EMX1', 'CCL11', 'CACNG3', 'KCNA5', 'PLAT', 'PRAMEF12', 'NPAS1', 'DSG2', 'DSG1', 'PPARD', 'CYP4A11', 'ACHE', 'ABCC9', 'FGF4', 'PRKD1', 'OR2B6', 'ERBB3', 'KCNC4', 'C8G', 'ITGA10', 'WNT1', 'IL13RA2', 'PKP1', 'HMGCS2', 'PARK2', 'CELP', 'GABRG3', 'POU6F2', 'IL3', 'FOLR1', 'LRRC15', 'TNFSF11', 'OVOL2', 'GABRA3', 'PPY', 'SLC6A5', 'MAGEA8', 'KISS1', 'WNT2B', 'COMP', 'CDKL5', 'CYP3A5', 'SDC3', 'CDH4', 'GFAP', 'ZIC2', 'SLC7A11', 'GALNT18', 'RAPGEF5', 'KRT81', 'UPK2', 'CDH1', 'MAGEA11', 'CYP1A1', 'ARHGAP22', 'CELA2A', 'DSC3', 'COL4A2', 'HYAL1', 'SELE', 'APLP1', 'KCNJ9', 'ANXA10', 'REG1B', 'TMEM8B', 'GCK', 'SGCD', 'CTNNA2', 'TDO2', 'SLC10A1', 'ALX1', 'MAGEA12', 'GIP', 'CDR2L', 'P2RX6', 'CRYAA', 'TBX10', 'RRH', 'NTN3', 'SERPINB13', 'WNT2', 'SHOX', 'HOXC5', 'FZR1', 'SMR3A', 'OR10H3', 'CYP2E1', 'DLX4', 'BMPR1B', 'TNC', 'HIST1H1B', 'KCNC1', 'GNAT1', 'OR2F2', 'KRT8', 'CST6', 'TNNC1', 'PLA2G2A', 'KLK10', 'SOX2', 'FBXL2', 'NCAN', 'PPP1R1A', 'WISP2', 'ASIC2', 'FOXE1', 'ITPKA', 'BCAR3', 'NPHS1', 'TLN2', 'GPR3', 'SPINK1', 'FRMPD1', 'TRPC2', 'STARD13', 'TFF1', 'PROL1', 'DKK4', 'MALL', 'ATP4A', 'TWIST1', 'GML', 'NRXN2', 'UMOD', 'ONECUT2', 'IGFBP1', 'ASCL1', 'MID1', 'PI15', 'STMN2', 'GNG4', 'OR2J2', 'PHOX2B', 'MYH15', 'RAI14', 'GHRH', 'OR5I1', 'DRD3', 'RAD54L', 'LY6H', 'SPEF1', 'MEP1A', 'TJP1', 'ALDH3B2', 'SLIT2')
+genes_part_2 = c('EDDM3A', 'MYO1A', 'CAPN6', 'PGD', 'PLEKHA6', 'CALML3', 'BMP8A', 'BMP3', 'TEX28', 'FUT1', 'KRT14', 'KRT76', 'HIST1H2AK', 'ALOX12B', 'WFDC2', 'CYP11B1', 'ACKR2', 'SEMA3D', 'RAMP2', 'PON3', 'NUDC', 'DRD2', 'ADH1C', 'PARD3', 'ELAVL2', 'PRICKLE3', 'TFAP2C', 'GJA1', 'KRT9', 'RAPSN', 'UPK1B', 'TEAD1', 'MAGEC1', 'SPINK5', 'DOC2A', 'GUCY2C', 'GPR143', 'KRT16', 'GRM2', 'CAPN9', 'ZMYND10', 'WNT8B', 'MOG', 'MAGEA2', 'FSHR', 'TLX1', 'SLC2A5', 'REN', 'AFF2', 'VIP', 'HYPM', 'CSN1S1', 'POM121L2', 'SPOCK3', 'SPINT3', 'LCE2B', 'MPPED1', 'IAPP', 'ADAM20', 'CSN3', 'SPRR1A', 'TRIM10', 'RPL18', 'CHRNB4', 'KCNA1', 'DAO', 'SLC12A3', 'SLC22A24', 'KRT86', 'AGT', 'CHRDL1', 'PCSK1', 'NPR2', 'ENDOU', 'PAX2', 'RAG2', 'CCL16', 'PRPS1L1', 'GABRB3', 'SMR3B', 'WT1', 'SYDE1', 'POU3F4', 'FUT6', 'PSG11', 'FOXF2', 'OR2H1', 'MYBPH', 'FZD7', 'MCF2', 'CHRNB3', 'C6', 'ATP6V1B1', 'ADAM22', 'FETUB', 'STON1', 'OR2F1', 'ARNT2', 'GRP', 'C22orf31', 'CSHL1', 'LDLR', 'RGS7', 'MLANA', 'IL5', 'TTTY1', 'S100A3', 'AHDC1', 'PRSS2', 'F2RL3', 'SLC29A2', 'MYF6', 'MYH2', 'NRP2', 'EMX2', 'ADH6', 'SLC6A4', 'ZP2', 'APOBEC1', 'SRY', 'ABCA6', 'CELSR3', 'FGFR4', 'RLBP1', 'PLTP', 'APOD', 'NMNAT2', 'IFNA4', 'CCK', 'IRGC', 'LPAL2', 'PTPRB', 'FGFR3', 'PPP1R37', 'INSM1', 'KCNJ8', 'FLRT2', 'NTRK1', 'BAI2', 'CCDC106', 'CYP7B1', 'ACADL', 'PCDHB17', 'PRRG1', 'SEMA5A', 'SRPX', 'POU3F1', 'SLC34A1', 'PDHA2', 'ESPL1', 'FMO1', 'FAM131B', 'STEAP1', 'HPGDS', 'TRIL', 'MAGEA3', 'SPRR1B', 'SLC17A2', 'HIST1H2AL', 'RAB40C', 'SPIN2A', 'ASB9', 'HTR6', 'ATP6V1G2', 'MYH8', 'ITIH2', 'CRTC1', 'GRIN2D', 'TACR3', 'BMP10', 'GPX2', 'AMPD1', 'CRX', 'COL11A1', 'BRINP1', 'LSS', 'MSLN', 'HLF', 'CPN1', 'HAAO', 'PTGIS', 'DPYS', 'SULF1', 'FGF3', 'TGM4', 'GYG2', 'MEIS2', 'SLC6A1', 'GABRA6', 'MAPK10', 'NR5A1', 'APOF', 'GABRP', 'LHCGR', 'SCGB2A1', 'NDP', 'SLC26A10', 'NPTX2', 'SERPINA7', 'PITX1', 'EPHA2', 'TFAP2B', 'EML1', 'AADAC', 'TPO', 'AKR1B10', 'KRT75', 'SLC5A2', 'DCX', 'SHANK2', 'ADRA2A', 'EXPH5', 'UNC93A', 'DKK3', 'THBS2', 'PLXNB3', 'FBXL7', 'ACSM1', 'PSD3', 'CACNA1F', 'HIST1H2BL', 'TFF2', 'SCN7A', 'NUDCD3', 'APOB', 'TEKT2', 'HTR1E', 'MAGEA4', 'TTC28', 'CDK5R2', 'GK2', 'MTSS1L', 'S100G', 'ADCYAP1R1', 'GJC1', 'FADS2', 'DCT', 'IFNA8', 'INHBC', 'PKLR', 'MDK', 'CFHR4', 'NRTN', 'COL21A1', 'ROS1', 'PHKA1', 'AP2A2', 'BMP4', 'ITGB6', 'B3GALT5', 'CCL27', 'RECQL4', 'SH3BGR', 'TBX6', 'GHRHR', 'NNAT', 'CELA3A', 'INS', 'KCNK2', 'RARRES2', 'ZNF157', 'CABP1', 'KRT20', 'OPN1SW', 'SSTR2', 'ERC2-IT1', 'GABRB1', 'ASS1', 'SORCS3', 'ANKRD1', 'HGFAC', 'GATA4', 'SYCP1', 'POU2F3', 'NLGN4Y', 'PNLIPRP2', 'TGFB2', 'ATP1A3', 'GP2', 'CLDN7', 'GJA8', 'AKAP3', 'RFPL1', 'GPD1', 'HOXC6', 'LOX', 'SLC6A9', 'PPEF1', 'FOSL1', 'CELA2B', 'MAPK12', 'BTF3P13', 'HLA-DPA2', 'MTTP', 'PPARG', 'GNB3', 'CPZ', 'IFNB1', 'CHRNA4', 'MUC7', 'GREM1', 'ADCY10', 'MLLT4-AS1', 'MYOZ2', 'HCRT', 'CP', 'PAGE1', 'SLCO1A2', 'MYH7', 'MAS1', 'KRT2', 'DCBLD2', 'XPNPEP2', 'AGTR1', 'AMELX', 'CEL', 'ABCA12', 'MPZ', 'TEC', 'MAGEA1', 'CUBN', 'SPINT1', 'SLC8A2', 'LRRC17', 'CPNE6', 'KIAA1462', 'SLC5A1', 'TMEM246', 'AMOT', 'LPAR4', 'CBLN1', 'PTTG2', 'PIK3C2G', 'NR2E1', 'MTCL1', 'PACRG', 'PTPN14', 'DEFB1', 'STXBP5L', 'OAZ3', 'TSR3', 'SOSTDC1', 'DCC', 'MAPK11', 'NPY1R', 'DGKG', 'POU4F2', 'RALYL', 'FASN', 'HOXB13', 'SPAG11A', 'LCN1', 'RBMS3', 'GABRA5', 'ZFYVE9', 'EFNB2', 'ANKRD34C', 'GH1', 'EFHD1', 'ESR1', 'AKAP4', 'SLC26A3', 'OTC', 'TULP2', 'SLC2A4', 'MAB21L1', 'GFPT2', 'LRP4', 'PAX3', 'HSD3B1', 'SLC13A3', 'ACOX2', 'GPR37L1', 'ZNF549', 'WISP1', 'SEC14L2', 'NEUROD2', 'ADH7', 'PP14571', 'CDH5', 'TBR1', 'LDHC', 'KANK3', 'TIE1', 'FGF12', 'KDELR3', 'LOC81691', 'RYR3', 'KCNF1', 'COBL', 'CSPG4', 'LMO3', 'RHOBTB2', 'CPB2', 'PITX2', 'GRK4', 'PRM1', 'RAB40A', 'SERPINE1', 'CCNO')
+genes_part_3 = c('STXBP1', 'FSCN2', 'SV2A', 'CDKL1', 'CST1', 'KCNB2', 'KCNH2', 'ITGA9', 'KCNMA1', 'BMP1', 'HIST1H3I', 'CCBL1', 'MYO1D', 'KATNB1', 'ANXA2P1', 'HPN', 'GRIA1', 'TNNI1', 'PMS2P4', 'NEUROD1', 'MAT1A', 'PLA2G4C', 'PPIL6', 'CHST1', 'ADIRF', 'CYP4B1', 'NTNG1', 'LCAT', 'PTPRD', 'SLMO1', 'TP53TG5', 'LECT2', 'RHBDF1', 'CRYBB3', 'CFHR3', 'OR2H2', 'CELSR2', 'FBLN1', 'CHRM3', 'COL5A2', 'GALR2', 'GIF', 'NLGN1', 'MEP1B', 'MOK', 'MAOB', 'MMP12', 'TEAD3', 'SMTN', 'TNFSF9', 'FGF2', 'CRYBA1', 'CACNB2', 'CDON', 'PCDH11X', 'GABRG2', 'BMP5', 'ERG', 'FSTL4', 'BNC1', 'MEF2B', 'TRAP1', 'N4BP3', 'AP1G2', 'LEP', 'CNKSR1', 'HSPB2', 'TCL1B', 'MPP3', 'JAG2', 'PDYN', 'MMP3', 'CSRP3', 'GJB3', 'LHX1', 'IL12B', 'ADD2', 'LGALS4', 'SNAP91', 'PAX1', 'HTR1B', 'SBSPON', 'CDH13', 'KRT35', 'CHRNA1', 'PON1', 'NAV3', 'ENPP2', 'FAM189A1', 'CHST15', 'PTH', 'EYA2', 'DIAPH2-AS1', 'CYP24A1', 'SFTPD', 'HBEGF', 'SLC6A13', 'HNF4G', 'TADA3', 'SLC26A4', 'C9orf3', 'MYBPC2', 'LBX1', 'SRD5A2', 'JUP', 'ZNF132', 'CA9', 'GRIN2A', 'CNGA3', 'JPH3', 'NRXN3', 'IGFBP3', 'MTMR7', 'SLC4A3', 'KRT31', 'AKAP6', 'PTGDR2', 'COL4A6', 'BTN1A1', 'PPFIA4', 'GAL', 'LRRC41', 'FAM47E', 'BAI3', 'CAP2', 'KAZN', 'HGC6.3', 'SLC22A14', 'DYNC1I1', 'OR1E1', 'ADCYAP1', 'CRYAB', 'RIBC2', 'ADAM21', 'ELOVL6', 'PMP22', 'DCLK1', 'B9D1', 'DNASE1L3', 'ADRA1A', 'DOK5', 'PINLYP', 'DES', 'NID2', 'PIWIL1', 'MMP13', 'COL4A1', 'CYP3A43', 'BRS3', 'CHRNE', 'COL16A1', 'CALCB', 'NRXN1', 'REG1P', 'DNM1', 'RND2', 'PTMS', 'MADCAM1', 'KRT15', 'AVPR1A', 'SLCO1B1', 'COL6A3', 'GABRD', 'ANO3', 'DAG1', 'RAMP3', 'COL10A1', 'SHROOM2', 'KRT4', 'KCNE1', 'PRLR', 'SPAM1', 'CLCN1', 'GRIP1', 'LILRP2', 'TENM4', 'SLC2A2', 'C8A', 'LYPLA2', 'DIXDC1', 'CLCA2', 'CCKAR', 'ARHGEF16', 'IGSF1', 'F9', 'OPCML', 'AQP6', 'TCHH', 'RGR', 'SYP', 'SLC7A2', 'CHGA', 'F2RL2', 'LINC00302', 'WWC1', 'TLL1', 'BFSP2', 'TBX5', 'PPM1E', 'PRRG2', 'PPFIA2', 'LRRTM2', 'CDC25C', 'PTPRU', 'OVOL3', 'C1orf105', 'RASSF9', 'SUSD5', 'SEMA6A', 'PCDH17', 'ODF1', 'PPIC', 'DOC2B', 'AIPL1', 'SLC9A3', 'CRHR2', 'CAPN11', 'FAM110B', 'SHBG', 'CACNA1B', 'ALB', 'SLC17A7', 'GRM1', 'INVS', 'TUSC3', 'KRT12', 'MMACHC', 'S100A5', 'KDR', 'HOXB1', 'IFNA10', 'ERBB4', 'CRHBP', 'EFNA1', 'PCDHA9', 'SLC22A13', 'DRD1', 'DLX5', 'PNMT', 'GPR116', 'MLLT4', 'B3GALNT1', 'SCN2A', 'ATP2B3', 'CFI', 'CDK18', 'OMD', 'SLC10A2', 'SOX9', 'DTNA', 'OLIG2', 'PIR', 'HOXA11', 'CNTN5', 'TYMS', 'KIAA0087', 'EPX', 'EMID1', 'GPR1', 'HOXD8', 'MGAT3', 'ZNRF4', 'GLRB', 'PLP1', 'TBL3', 'INSL3', 'F10', 'NR1H4', 'PDE1B')
+network_rank = c(genes_part_1, genes_part_2, genes_part_3)
+```
+
+```{r blood_networks, warning = FALSE, message = FALSE  }
+networks_perf = vector('list', length = 5 * length(n_vals))
+index = 1
+# loop to perform cross validation
+for (i in c(1:5)) {
+  # train-test folds split
+  preproc = fs_preproc(test_fold = i)
+  cv_x_train = preproc$x_train
+  cv_x_test = preproc$x_test
+  cv_y_train = preproc$y_train
+  cv_y_test = preproc$y_test
+  # loop to select optimal number of significant genes
+  for (n in n_vals) {
+    # select the top n genes
+    de = network_rank[1:n]
+    cv_train_reduced = cv_x_train[de,]
+    cv_test_reduced = cv_x_test[de,]
+    # random forest to evaluate the feature selectin method
+    rf = randomForest(t(cv_train_reduced), cv_y_train$outcome)
+    pred_prob = predict(rf, t(cv_test_reduced), type = 'prob')[,'reject']
+    roc_obj = roc(response = cv_y_test$outcome, predictor = pred_prob)
+    # extract sensitivity
+    networks_perf[[index]] = data.frame(gene_number = n, 
+                               auc = auc(roc_obj) |> as.numeric())
+    index = index + 1
+  }
+}
+# calculate the overall performance of each n value
+networks_perf = networks_perf |> bind_rows() |> drop_na()
+networks_rank = networks_perf |> 
+  group_by(gene_number) |> 
+  summarise(mean_auc = mean(auc)) |> 
+  arrange(desc(mean_auc))
+# visualize the performance of each n
+networks_rank_long = networks_rank |> 
+  pivot_longer(cols = mean_auc, names_to = 'metric', values_to = 'value')
+(ggplot(data = networks_rank_long, aes(x = gene_number, y = value)) +
+    geom_line() + 
+    labs(x = 'Gene number', y = 'Area Under the Curve (AUC)', title = 'Performance of Networks with different numbers of genes on Blood data') + 
+    theme_bw()) |> 
+  ggplotly()
+networks_rank |> datatable(colnames = c('Gene number', 'Mean AUC'))
+# retain the best performing n value
+best_avg_perf[[7]] = data.frame(method = rep('Network', 5),
+                                networks_perf |> 
+                                  filter(gene_number == 400))
+```
+
+### Comparative Boxplot
+
+```{r blood_comparative_boxplot, warning = FALSE, message = FALSE  }
+best_avg_perf = best_avg_perf |> bind_rows()
+best_avg_perf_long = best_avg_perf |> 
+  pivot_longer(cols = auc, names_to = 'metric', values_to = 'value')
+p3 = ggplot(best_avg_perf_long, aes(x = factor(method), y = value, fill = gene_number)) +
+  geom_boxplot() +
+  labs(
+    title = 'B. Blood',
+    y = 'Area Under Curve (AUC)', x = 'Feature Selection Methods'
+  ) + 
+  scale_fill_gradient(
+    name = 'Gene Number', 
+    low = 'white', 
+    high = 'black'
+  ) +
+  theme_bw()
+p3 |> ggplotly()
+best_avg_perf %>% 
+  group_by(method, gene_number) %>% 
+  summarise(mean_auc = mean(auc)) %>% 
+  arrange(desc(mean_auc)) |> 
+  datatable(colnames = c('Method', 'Gene number', 'Mean AUC'))
+```
+
+## Model Selection
+
+```{r blood_model_selection_frame, warning = FALSE, message = FALSE  }
+# comparing frame for model selection
+model_selection = vector('list', length = 8)
+# values of thresholds to be fine-tuned
+thresholds = seq(from = 0.3, to = 0.7, by = 0.05)
+```
+
+### k-Nearest Neighbours (kNN)
+
+```{r blood_knn, warning = FALSE, message = FALSE  }
+k_vals = c(1, 3, 5, 7, 10, 15, 25)
+knn_perf = vector('list', 5 * length(k_vals) * length(thresholds))
+index = 1
+for (i in 1:5) {
+  preproc = blood_preproc(test_fold = i)
+  cv_train_reduced = preproc$x_train
+  cv_test_reduced = preproc$x_test
+  cv_y_train = preproc$y_train
+  cv_y_test = preproc$y_test
+  for (k in k_vals) {
+    knn = knn3(t(cv_train_reduced), cv_y_train$outcome, k = k)
+    pred_prob = predict(knn, t(cv_test_reduced))[,'reject']
+    for (t in thresholds) {
+    pred_class = ifelse(pred_prob > t, 'reject', 'stable') %>%
+      factor(levels = c('stable', 'reject'))
+    conf_mat = confusionMatrix(data = pred_class,
+                              reference = cv_y_test$outcome, positive = 'reject')
+    knn_perf[[index]] = data.frame(k = k, threshold = t,
+                                  f1 = conf_mat$byClass['F1'],
+                                  f2 = f2(pred_class, cv_y_test))
+    index = index + 1
+    }
+  }
+}
+knn_perf = bind_rows(knn_perf)
+knn_rank = knn_perf |>
+  group_by(k, threshold) |>
+  summarise(mean_f1 = mean(f1),
+            mean_f2 = mean(f2)) |>
+  arrange(desc(0.4 * mean_f1 + 0.6 * mean_f2), threshold)
+knn_rank_long = knn_rank |>
+  pivot_longer(cols = mean_f1:mean_f2, names_to = 'metric', values_to = 'value')
+knn_rank |> 
+  datatable(colnames = c('k', 'threshold', 'mean F1 score', 'mean F2 score'))
+model_selection[[1]] = data.frame(method = rep('KNN', 5),
+                                  knn_perf |>
+                                    filter(k == knn_rank$k[1]) |> 
+                                    filter(threshold == knn_rank$threshold[1]) |> 
+                                    select(-c(k, threshold)))
+```
+
+### Random Forest
+
+```{r blood_random_forest, warning = FALSE, message = FALSE  }
+mtry_vals = c(1, 2, 5)
+min.node.sizes = c(1, 2, 5)
+rf_perf = vector('list', length = 5 * length(thresholds) * length(mtry_vals) * length(min.node.sizes))
+index = 1
+for (i in c(1:5)) {
+  preproc = blood_preproc(test_fold = i)
+  cv_train_reduced = preproc$x_train
+  cv_test_reduced = preproc$x_test
+  cv_y_train = preproc$y_train
+  cv_y_test = preproc$y_test
+  cv_train_t = t(cv_train_reduced) |> data.frame()
+  cv_train_t$outcome = cv_y_train$outcome
+  for (mtry in mtry_vals) {
+    for (node in min.node.sizes) {
+      rf = ranger(outcome ~ ., data = cv_train_t,
+                  mtry = mtry, min.node.size = node, 
+                  probability = TRUE, splitrule = 'extratrees',
+                  classification = TRUE, scale = TRUE)
+      for (t in thresholds) {
+        pred_prob = predict(rf, data.frame(t(cv_test_reduced)), 
+                        type = 'response')$predictions[,'reject']
+        pred_class = ifelse(pred_prob > t, 'reject', 'stable') |> 
+          factor(levels = c('stable', 'reject'))
+        conf_mat = confusionMatrix(pred_class, cv_y_test$outcome)
+        rf_perf[[index]] = data.frame(mtry = mtry, min_node_size = node, threshold = t,
+                                      f1 = conf_mat$byClass['F1'],
+                                      f2 = f2(pred_class, cv_y_test))
+        index = index + 1
+      }
+    }
+  }
+}
+rf_perf = bind_rows(rf_perf)
+rf_perf_rank = rf_perf |> 
+  group_by(mtry, min_node_size, threshold) |> 
+  summarise(mean_f1 = mean(f1, na.rm = TRUE),
+            mean_f2 = mean(f2, na.rm = TRUE))|> 
+  arrange(desc(0.4 * mean_f1 + 0.6 * mean_f2))
+rf_perf_rank_long = rf_perf_rank |> 
+  pivot_longer(cols = mean_f1:mean_f2, names_to = 'metric', values_to = 'value')
+rf_perf_rank |> 
+  datatable(colnames = c('mtry', 'min.node.size', 'threshold', 
+                         'mean F1 score', 'mean F2 score'))
+model_selection[[2]]= data.frame(method = rep('RF', 5),
+                          rf_perf |> 
+                            filter(mtry == rf_perf_rank$mtry[1]) |> 
+                            filter(min_node_size == rf_perf_rank$min_node_size[1]) |>
+                            filter(threshold == rf_perf_rank$threshold[1]) |> 
+                            select(-c(mtry, min_node_size, threshold)))
+```
+
+### Logistic Regression
+
+```{r blood_logistic_regression, warning = FALSE, message = FALSE  }
+lambda_grid = 10^seq(-5, 0, length = 10)
+alpha_values = c(0.1, 0.4, 0.6, 0.9)
+log_perf = vector('list', length = 5 * length(lambda_grid) * length(alpha_values) * length(thresholds))
+index = 1
+for (i in c(1:5)) {
+  preproc = blood_preproc(test_fold = i)
+  cv_train_reduced = preproc$x_train
+  cv_test_reduced = preproc$x_test
+  cv_y_train = preproc$y_train
+  cv_y_test = preproc$y_test
+  for (lambda in lambda_grid) {
+    for (a in alpha_values) {
+      lr = glmnet(t(cv_train_reduced), cv_y_train$outcome, family = 'binomial', 
+                  alpha = a, lambda = lambda, standardize = FALSE)
+      pred_prob = predict(lr, t(cv_test_reduced), type = 'response')[,1]
+      for (t in thresholds) {
+        pred_class = ifelse(pred_prob > t, 'reject', 'stable') |>
+          factor(levels = c('stable', 'reject'))
+        conf_mat = confusionMatrix(cv_y_test$outcome, pred_class, positive = 'reject')
+        log_perf[[index]] = data.frame(lambda = lambda, alpha = a, threshold = t,
+                                       f1 = conf_mat$byClass['F1'], 
+                                       f2 = f2(pred_class, cv_y_test))
+        index = index + 1
+      }
+    }
+  }
+}
+log_perf = bind_rows(log_perf)
+log_perf_rank = log_perf |> 
+  group_by(lambda, alpha, threshold) |> 
+  summarise(mean_f1 = mean(f1, na.rm = TRUE),
+            mean_f2 = mean(f2, na.rm = TRUE)) |> 
+  arrange(desc(0.4 * mean_f1 + 0.6 * mean_f2))
+log_perf_rank_long = log_perf_rank |> 
+  pivot_longer(cols = mean_f1:mean_f2, names_to = 'metric', values_to = 'value')
+log_perf_rank |> 
+  datatable(colnames = c('lambda', 'alpha', 'threshold', 
+                         'mean F1 score', 'mean F2 score'))
+model_selection[[3]] = data.frame(method = rep('LR', 5),
+                                  log_perf |> 
+                                     filter(lambda == log_perf_rank$lambda[1]) |> 
+                                     filter(alpha == log_perf_rank$alpha[1]) |> 
+                                     filter(threshold == log_perf_rank$threshold[1]) |> 
+                                     select(-c(lambda, alpha, threshold)))
+```
+
+### SVM
+
+#### SVM Linear
+
+```{r blood_svm_linear, warning = FALSE, message = FALSE  }
+C_vals = 2^(-5:5)
+svm_linear_perf = vector('list', length = 5 * length(C_vals) * length(thresholds))
+index = 1
+for (i in c(1:5)) {
+  preproc = blood_preproc(test_fold = i)
+  cv_train_reduced = preproc$x_train
+  cv_test_reduced = preproc$x_test
+  cv_y_train = preproc$y_train
+  cv_y_test = preproc$y_test
+  for (c in C_vals) {
+    svm = svm(x = t(cv_train_reduced), y = cv_y_train$outcome, 
+              cost = c, kernel = 'linear', probability = TRUE)
+    pred_prob = predict(svm, t(cv_test_reduced), probability = TRUE) %>% 
+      attr('probabilities')
+    pred_prob = pred_prob[,'reject']
+    for (t in thresholds) {
+      pred_class = ifelse(pred_prob > t, 'reject', 'stable') %>%
+        factor(levels = c('stable', 'reject'))
+      conf_mat = confusionMatrix(data = pred_class, 
+                                reference = cv_y_test$outcome, positive = 'reject')
+      svm_linear_perf[[index]] = data.frame(C = c, threshold = t,
+                                            f1 = conf_mat$byClass['F1'],
+                                            f2 = f2(pred_class, cv_y_test))
+      index = index + 1
+    }
+  }
+}
+svm_linear_perf = bind_rows(svm_linear_perf)
+svm_linear_rank = svm_linear_perf %>% 
+  group_by(C, threshold) %>% 
+  summarise(mean_f1 = mean(f1),
+            mean_f2 = mean(f2)) %>% 
+  arrange(desc(0.4 * mean_f1 + 0.6 * mean_f2))
+svm_linear_rank |> 
+  datatable(colnames = c('C', 'threshold', 'mean F1 score', 'mean F2 score'))
+model_selection[[4]] = data.frame(method = rep('SVM-L', 5),
+                                  svm_linear_perf %>%
+                                     filter(C == svm_linear_rank$C[1]) %>% 
+                                     filter(threshold == svm_linear_rank$threshold[1]) |> 
+                                     select(-c(C, threshold)))
+```
+
+#### SVM Radial
+
+```{r blood_svm_radial, warning = FALSE, message = FALSE  }
+gamma_vals = 2^c(-10, -5, 0, 5, 10)
+svm_radial_perf = vector('list', length = 5 * length(C_vals) * length(gamma_vals) * length(thresholds))
+index = 1
+for (i in c(1:5)) {
+  preproc = blood_preproc(test_fold = i)
+  cv_train_reduced = preproc$x_train
+  cv_test_reduced = preproc$x_test
+  cv_y_train = preproc$y_train
+  cv_y_test = preproc$y_test
+  for (c in C_vals) {
+    for (gamma in gamma_vals) {
+      svm = svm(x = t(cv_train_reduced), y = cv_y_train$outcome, 
+                cost = c, kernel = 'radial', gamma = gamma, probability = TRUE)
+      pred_prob = predict(svm, t(cv_test_reduced), probability = TRUE) %>% 
+        attr('probabilities')
+      pred_prob = pred_prob[,'reject']
+      for (t in thresholds) {
+        pred_class = ifelse(pred_prob > t, 'reject', 'stable') %>%
+          factor(levels = c('stable', 'reject'))
+        conf_mat = confusionMatrix(data = pred_class, 
+                                  reference = cv_y_test$outcome, positive = 'reject')
+        svm_radial_perf[[index]] = data.frame(C = c, gamma = gamma, threshold = t,
+                                              f1 = conf_mat$byClass['F1'],
+                                              f2 = f2(pred_class, cv_y_test))
+        index = index + 1
+      }
+    }
+  }
+}
+svm_radial_perf = bind_rows(svm_radial_perf)
+svm_radial_rank = svm_radial_perf %>% 
+  group_by(C, gamma, threshold) %>% 
+  summarise(mean_f1 = mean(f1),
+            mean_f2 = mean(f2)) %>% 
+  arrange(desc(0.4 * mean_f1 + 0.6 * mean_f2))
+svm_radial_rank |> 
+  datatable(colnames = c('C', 'gamma', 'threshold', 'mean F1 score', 'mean F2 score'))
+model_selection[[5]] = data.frame(method = rep('SVM-R', 5),
+                                  svm_radial_perf %>% 
+                                     filter(C == svm_radial_rank$C[1]) %>% 
+                                     filter(gamma == svm_radial_rank$gamma[1]) %>% 
+                                     filter(threshold == svm_radial_rank$threshold[1]) |> 
+                                     select(-c(C, gamma, threshold)))
+```
+
+#### SVM Polynomial
+
+```{r blood_svm_polynomial, warning = FALSE, message = FALSE  }
+degrees = c(2,3,4)
+zero_coef = c(0, 1, 10)
+svm_poly_perf = vector('list', length = 5 * length(degrees) * length(zero_coef) * length(thresholds) * length(C_vals))
+index = 1
+for (i in c(1:5)) {
+  preproc = blood_preproc(test_fold = i)
+  cv_train_reduced = preproc$x_train
+  cv_test_reduced = preproc$x_test
+  cv_y_train = preproc$y_train
+  cv_y_test = preproc$y_test
+  for (c in C_vals) {
+    for (d in  degrees) {
+      for (z in zero_coef) {
+        svm = svm(x = t(cv_train_reduced), y = cv_y_train$outcome,
+                        cost = c, kernel = 'polynomial', degree = d,
+                        coef0 = z, probability = TRUE)
+        pred_prob = predict(svm, t(cv_test_reduced), probability = TRUE) %>% 
+          attr('probabilities')
+        pred_prob = pred_prob[,'reject']
+        for (t in thresholds) {
+          pred_class = ifelse(pred_prob > t, 'reject', 'stable') %>%
+            factor(levels = c('stable', 'reject'))
+          conf_mat = confusionMatrix(data = pred_class, 
+                                    reference = cv_y_test$outcome, 
+                                    positive = 'reject')
+          svm_poly_perf[[index]] = data.frame(C = c, degree = d, coef0 = z, 
+                                              threshold = t,
+                                              f1 = conf_mat$byClass['F1'],
+                                              f2 = f2(pred_class, cv_y_test))
+          index = index + 1
+        }
+      }
+    }
+  }
+}
+svm_poly_perf = bind_rows(svm_poly_perf)
+svm_poly_rank = svm_poly_perf %>% 
+  group_by(C, degree, coef0, threshold) %>% 
+  summarise(mean_f1 = mean(f1),
+            mean_f2 = mean(f2)) %>% 
+  arrange(desc(0.4 * mean_f1 + 0.6 * mean_f2))
+svm_poly_rank |> 
+  datatable(colnames = c('C', 'degree', 'coef0', 'threshold', 
+                         'mean F1 score', 'mean F2 score'))
+model_selection[[6]] = data.frame(method = rep('SVM-P', 5),
+                                  svm_poly_perf %>% 
+                                     filter(C == svm_poly_rank$C[1]) %>% 
+                                     filter(degree == svm_poly_rank$degree[1]) %>% 
+                                     filter(coef0 == svm_poly_rank$coef0[1]) %>% 
+                                     filter(threshold == svm_poly_rank$threshold[1]) |> 
+                                     select(-c(C, degree, coef0, threshold)))
+```
+
+#### SVM Sigmoid
+
+```{r blood_svm_sigmoid, warning = FALSE, message = FALSE  }
+svm_sigmoid_perf = vector('list', length = 5 * length(thresholds) * length(C_vals) * length(gamma_vals) * length(zero_coef))
+index = 1
+for (i in c(1:5)) {
+  preproc = blood_preproc(test_fold = i)
+  cv_train_reduced = preproc$x_train
+  cv_test_reduced = preproc$x_test
+  cv_y_train = preproc$y_train
+  cv_y_test = preproc$y_test
+  for (c in C_vals) {
+    for(g in gamma_vals) {
+      for (z in zero_coef) {
+        svm = svm(x = t(cv_train_reduced), y = cv_y_train$outcome,
+                        cost = c, kernel = 'sigmoid', gamma = g,
+                        coef0 = z, probability = TRUE)
+        pred_prob = predict(svm, t(cv_test_reduced), probability = TRUE) %>% 
+          attr('probabilities')
+        pred_prob = pred_prob[,'reject']
+        for (t in thresholds) {
+          pred_class = ifelse(pred_prob > t, 'reject', 'stable') %>%
+            factor(levels = c('stable', 'reject'))
+          conf_mat = confusionMatrix(data = pred_class, 
+                                    reference = cv_y_test$outcome, 
+                                    positive = 'reject')
+          svm_sigmoid_perf[[index]] = data.frame(C = c, gamma = g, coef0 = z, threshold = t,
+                                                 f1 = conf_mat$byClass['F1'],
+                                                 f2 = f2(pred_class, cv_y_test))
+          index = index + 1
+        }
+      }
+    }
+  }
+}
+svm_sigmoid_perf = svm_sigmoid_perf |> bind_rows()
+svm_sigmoid_rank = svm_sigmoid_perf %>% 
+  group_by(C, gamma, coef0, threshold) %>% 
+  summarise(mean_f1 = mean(f1),
+            mean_f2 = mean(f2)) %>% 
+  arrange(desc(0.4 * mean_f1 + 0.6 * mean_f2))
+svm_sigmoid_rank |> 
+  datatable(colnames = c('C', 'gamma', 'coef0', 'threshold', 
+                         'mean F1 score', 'mean F2 score'))
+model_selection[[7]] = data.frame(method = rep('SVM-S', 5),
+                                  svm_sigmoid_perf %>% 
+                                     filter(C == svm_sigmoid_rank$C[1]) %>% 
+                                     filter(gamma == svm_sigmoid_rank$gamma[1]) %>% 
+                                     filter(coef0 == svm_sigmoid_rank$coef0[1]) %>% 
+                                     filter(threshold == svm_sigmoid_rank$threshold[1]) |> 
+                                     select(-c(C, gamma, coef0, threshold)))
+```
+
+### XGBoost
+
+```{r blood_xgboost, warning = FALSE, message = FALSE  }
+eta_vals = c(0.05, 0.1, 0.3, 0.5, 0.8)
+max_depth_vals = c(1,4,5,7,8)
+nrounds = c(10, 15, 20, 30, 50, 75, 100)
+xgb_perf = vector('list', length = 5 * length(eta_vals) * length(max_depth_vals) * length(nrounds))
+index = 1
+for (i in c(1:5)) {
+  preproc = blood_preproc(test_fold = i)
+  cv_train_reduced = preproc$x_train
+  cv_test_reduced = preproc$x_test
+  cv_y_train = preproc$y_train
+  cv_y_test = preproc$y_test
+  dtrain = xgb.DMatrix(data = t(cv_train_reduced),
+                       label = ifelse(cv_y_train$outcome == 'stable', 0, 1))
+  dtest = xgb.DMatrix(data = t(cv_test_reduced))
+  for(e in eta_vals) {
+    for (d in max_depth_vals) {
+      for (n in nrounds) {
+         params = list(objective = 'binary:logistic',
+                      eval_metric = 'aucpr',
+                      eta = e,
+                      max_depth = d)
+          xgb = xgb.train(params = params, data = dtrain, nrounds = n, verbose = 0)
+          pred_prob = predict(xgb, dtest)
+          for (t in thresholds) {
+            pred_class = ifelse(pred_prob > t, 'reject', 'stable') %>%
+              factor(levels = c('stable','reject'))
+            conf_mat = confusionMatrix(data = pred_class, 
+                                      reference = cv_y_test$outcome,
+                                      positive = 'reject')
+            xgb_perf[[index]] = data.frame(eta = e, max_depth = d, nrounds = n, threshold = t,
+                                           f1 = conf_mat$byClass['F1'],
+                                           f2 = f2(pred_class, cv_y_test))
+            index = index + 1
+        }
+      }
+    }
+  }
+}
+xgb_perf = xgb_perf |> bind_rows()
+xgb_rank = xgb_perf %>% 
+  group_by(eta, max_depth, nrounds, threshold) %>% 
+  summarise(mean_f1 = mean(f1),
+            mean_f2 = mean(f2)) %>% 
+  arrange(desc(0.4 * mean_f1 + 0.6 * mean_f2))
+xgb_rank |> datatable(colnames = c('eta', 'max depth', 'nrounds', 'threshold', 
+                                   'mean F1 score', 'mean F2 score'))
+model_selection[[8]] = data.frame(method = rep('XGB', 5),
+                                  xgb_perf %>% 
+                                    filter(eta == xgb_rank$eta[1]) %>% 
+                                    filter(max_depth == xgb_rank$max_depth[1]) %>% 
+                                    filter(nrounds == xgb_rank$nrounds[1]) %>% 
+                                    filter(threshold == xgb_rank$threshold[1]) |> 
+                                    select(-c(eta, max_depth, nrounds, threshold)))
+```
+
+### Comparative Boxplots
+
+```{r blood_model_comparison, warning = FALSE, message = FALSE  }
+model_selection = model_selection |> bind_rows()
+model_selection_long = model_selection |> 
+  pivot_longer(cols = f1:f2, names_to = 'metric', values_to = 'value')
+p4 = ggplot(data = model_selection_long, 
+            aes(x = method, y = value)) + 
+  geom_boxplot() +
+  facet_wrap(~metric) + 
+    labs(title = 'B. Blood',
+         x = 'Model', y = 'Performance') +
+    theme_bw()
+p4 |> ggplotly()
+sum_model_selection = model_selection |> 
+  group_by(method) |> 
+  summarise(mean_f1 = mean(f1),
+            mean_f2 = mean(f2)) %>% 
+  arrange(desc(0.4 * mean_f1 + 0.6 * mean_f2))
+sum_model_selection_long = sum_model_selection |> 
+  pivot_longer(cols = mean_f1:mean_f2, names_to = 'metric', values_to = 'value')
+sum_model_selection |> 
+  datatable(colnames = c('method', 'mean F1 score', 'mean F2 score'))
+```
+
+## Model Construction & Evaluation
+
+```{r blood_model, warning = FALSE, message = FALSE  }
+# batch correction
+train_batched = ComBat(X_train, y_train$original_dataset)
+# normalize
+norm = normalize(train_batched, X_test)
+train_normed = norm$train
+test_normed = norm$test
+# feature selection
+de = blood_de(train_normed, y_train)
+train_de = train_normed[de,]
+test_de = test_normed[de,]
+# create data matrix for xgb
+dtrain = xgb.DMatrix(data = t(train_de),
+                     label = ifelse(y_train$outcome == 'stable', 0, 1))
+dtest = xgb.DMatrix(data = t(test_de))
+# fine-tuned xgb parameters
+best_eta = xgb_rank$eta[1]
+best_max_depth = xgb_rank$max_depth[1]
+best_nrounds = xgb_rank$nrounds[1]
+best_threshold = xgb_rank$threshold[1]
+# model construction
+params = list(objective = 'binary:logistic',
+              eval_metric = 'aucpr',
+              eta = best_eta,
+              max_depth = best_max_depth)
+xgb = xgb.train(params = params, data = dtrain, nrounds = best_nrounds, verbose = 0)
+# perform model on test set
+pred_prob = predict(xgb, dtest)
+pred_class = ifelse(pred_prob > best_threshold, 'reject', 'stable') |> 
+  factor(levels = c('stable', 'reject'))
+# performance evaluation
+confusionMatrix(data = pred_class, reference = y_test$outcome, positive = 'reject')
+```
+
+## Save the plots for the final report
+
+```{r blood_plots, warning = FALSE, message = FALSE  }
+plot_list = list(
+  blood_pca_noBatch = p1,
+  blood_pca_batch = p2,
+  blood_feature_selection = p3,
+  blood_model = p4
+)
+```
+
+# Biopsy Data
+
+## Data Cleaning
+
+### GSE53605
+
+**Originally:**
+
+-   55 patients
+
+-   22,277 genes
+
+```{r GSE53605, warning = FALSE, message = FALSE  }
+gse53605 <-getGEO("GSE53605", GSEMatrix = TRUE, AnnotGPL = TRUE)
+gse53605 <- gse53605[[1]]
+```
+
+#### pData
+
+-   37 rejected patients
+
+-   18 stable patients
+
+```{r pGSE53605, warning = FALSE, message = FALSE  }
+pGSE53605 <- pData(gse53605)
+# decide stable-reject outcome from the histological diagnosis
+pGSE53605$outcome <- pGSE53605$`histological diagnosis:ch1`
+pGSE53605$outcome[pGSE53605$outcome == "Normal allografts"] <- "stable"
+pGSE53605$outcome[pGSE53605$outcome == "calcineurin inhibitor toxicity (CNIT)"] <- "reject"
+pGSE53605$outcome[pGSE53605$outcome == "Acute Rejection (AR or ACR)"] <- "reject"
+pGSE53605$outcome[pGSE53605$outcome == "IF/TA"] <- "reject"
+pGSE53605$outcome = factor(pGSE53605$outcome, levels = c('stable', 'reject'))
+# get rid of unnecessary columns
+pGSE53605 <- pGSE53605[, !names(pGSE53605) %in% c("status", "submission_date", "last_update_date", "channel_count", "extract_protocol_ch1", "label_protocol_ch1", "extract_protocol_ch2", "label_protocol_ch2", "hyb_protocol", "scan_protocol", "data_processing", "contact_name", "contact_email", "contact_phone", "contact_laboratory", "contact_address", "contact_institute", "contact_department", "contact_city", "contact_state", "contact_zip/postal_code", "contact_country", "supplementary_file")]
+pGSE53605 = pGSE53605 |> select(c(geo_accession, outcome))
+pGSE53605 <- pGSE53605[!is.na(pGSE53605$outcome), ]
+```
+
+#### fData
+
+```{r fGSE53605, warning = FALSE, message = FALSE  }
+fGSE53605 = fData(gse53605)
+fGSE53605$gene_symbols <- fGSE53605$`Gene symbol`
+fGSE53605 = fGSE53605 |> remove_constant()
+has_multiple <- grepl("///", fGSE53605$`Gene symbol`, fixed = TRUE)
+# Split and assign only for those rows
+fGSE53605$gene_symbols[has_multiple] <- sapply(
+  strsplit(fGSE53605$`Gene symbol`[has_multiple], "\\s*///\\s*"),
+  `[`,
+  1
+)
+fGSE53605$gene_symbols <- trimws(fGSE53605$gene_symbols)
+fGSE53605 <- fGSE53605[!is.na(fGSE53605$gene_symbols), ]
+fGSE53605 = fGSE53605 |> select(c(ID, gene_symbols)) |> filter(gene_symbols != '')
+```
+
+#### eMat
+
+**After cleaning:**
+
+-   55 patients
+
+-   721 genes
+
+```{r eGSE53605, warning = FALSE, message = FALSE  }
+eGSE53605 = exprs(gse53605)
+eGSE53605 <- eGSE53605[rownames(fGSE53605), rownames(pGSE53605)]
+all(rownames(pGSE53605) %in% colnames(eGSE53605))
+# remove constant gene expressions
+eGSE53605 = eGSE53605[apply(eGSE53605, 1, 
+                            function(x) length(unique(x)) > 1),]
+eGSE53605 = limma_duplicates(eGSE53605, fGSE53605, pGSE53605)
+```
+
+### GSE138043
+
+**Originally:**
+
+-   52 patients
+
+-   16,885 genes
+
+```{r GSE138043, warning = FALSE, message = FALSE  }
+gse138043 <-getGEO("GSE138043", GSEMatrix = TRUE, AnnotGPL = TRUE)
+gse138043 <- gse138043[[1]]
+```
+
+#### pData
+
+-   15 rejected patients
+
+-   37 stable patients
+
+```{r pGSE138043, warning = FALSE, message = FALSE  }
+pGSE138043 <- pData(gse138043)
+pGSE138043 = pGSE138043 |> remove_constant() |> 
+  filter(`rejection at 12months post transplant:ch1` != '')
+pGSE138043$outcome = ifelse(pGSE138043$`rejection at 12months post transplant:ch1` == 'AR', 'reject', 'stable') |> factor(levels = c('stable', 'reject'))
+pGSE138043 <- pGSE138043[, !names(pGSE138043) %in% c("channel_count", "extract_protocol_ch1", "label_protocol_ch1", "extract_protocol_ch2", "label_protocol_ch2", "hyb_protocol", "scan_protocol", "data_processing", "contact_name", "contact_email", "contact_phone", "contact_laboratory", "contact_address", "contact_institute", "status", "submission_date", "last_update_date", "contact_department", "contact_city", "contact_state", "contact_zip/postal_code", "contact_country", "supplementary_file")]
+pGSE138043 = pGSE138043 |> select(c(geo_accession, outcome))
+```
+
+#### fData
+
+```{r fGSE138043, warning = FALSE, message = FALSE  }
+fGSE138043 <- fData(gse138043)
+fGSE138043 = fGSE138043 |> remove_constant() |> 
+  filter(gene_assignment != '') |> 
+  filter(gene_assignment != '---')
+# Only apply the split to rows with '///'
+has_multiple <- grepl("///", fGSE138043$gene_assignment)
+# For rows with multiple entries
+fGSE138043$gene_symbols <- NA
+fGSE138043$gene_symbols[has_multiple] <- sapply(strsplit(fGSE138043$gene_assignment[has_multiple], "///"), function(x) {
+  strsplit(trimws(x[1]), " // ")[[1]][2]
+})
+# For rows with single entry
+fGSE138043$gene_symbols[!has_multiple] <- sapply(strsplit(fGSE138043$gene_assignment[!has_multiple], " // "), `[`, 2)
+fGSE138043 = fGSE138043 |> select(ID, gene_symbols)
+```
+
+#### eMat
+
+**After cleaning:**
+
+-   52 patients
+
+-   16,389 genes
+
+```{r eGSE138043, warning = FALSE, message = FALSE  }
+eGSE138043 <- exprs(gse138043)
+# remove constant gene expressions
+eGSE138043 = eGSE138043[apply(eGSE138043, 1, 
+                            function(x) length(unique(x)) > 1),]
+#using limma(DE) to get the significant duplicates 
+eGSE138043 = limma_duplicates(eGSE138043, fGSE138043, pGSE138043)
+```
+
+### GSE14328
+
+**Originally:**
+
+-   36 patients
+-   54,675 genes
+
+```{r GSE14328, warning = FALSE, message = FALSE  }
+gse14328 <-getGEO("GSE14328", GSEMatrix = TRUE, AnnotGPL = TRUE)
+gse14328 <- gse14328[[1]]
+```
+
+#### pData
+
+-   18 rejected patients
+
+-   18 stable patients
+
+```{r pGSE14328, warning = FALSE, message = FALSE  }
+pGSE14328 <- pData(gse14328)
+pGSE14328 = pGSE14328 |> remove_constant()
+pGSE14328$outcome <- ifelse(
+  pGSE14328$`characteristics_ch1` == "stable",
+  "stable",
+  "reject"
+) |> 
+  factor(levels = c('stable', 'reject'))
+pGSE14328 <- pGSE14328[, !names(pGSE14328) %in% c("hyb_protocol", "hyb_protocol.1", "hyb_protocol.2", "hyb_protocol.3", "hyb_protocol.4", "hyb_protocol.5", "hyb_protocol.6", "hyb_protocol.7", "hyb_protocol.8", "hyb_protocol.9", "hyb_protocol.10", "scan_protocol", "scan_protocol.1", "scan_protocol.2", "scan_protocol.3", "scan_protocol.4",          "scan_protocol.5", "scan_protocol.6", "scan_protocol.7", "scan_protocol.8", "scan_protocol.9", "contact_name", "contact_email", "contact_phone", "contact_laboratory", "contact_address", "contact_institute", "status", "submission_date", "last_update_date", "contact_department", "contact_city", "contact_state", "contact_zip/postal_code", "contact_country", "supplementary_file", "extract_protocol_ch1")]
+pGSE14328 = pGSE14328 |> select(c(geo_accession, outcome))
+```
+
+#### fData
+
+```{r fGSE14328, warning = FALSE, message = FALSE  }
+fGSE14328 <- fData(gse14328)
+fGSE14328$gene_symbols <- fGSE14328$`Gene symbol`
+has_multiple <- grepl("///", fGSE14328$`Gene symbol`, fixed = TRUE)
+# Split and assign only for those rows
+fGSE14328$gene_symbols[has_multiple] <- sapply(
+  strsplit(fGSE14328$`Gene symbol`[has_multiple], "\\s*///\\s*"),
+  `[`,
+  1
+)
+fGSE14328$gene_symbols <- trimws(fGSE14328$gene_symbols)
+fGSE14328 <- fGSE14328[!is.na(fGSE14328$gene_symbols), ]
+fGSE14328 = fGSE14328 |> select(c(ID, gene_symbols)) |> 
+  filter(gene_symbols != '')
+```
+
+#### eMat
+
+**After cleaning:**
+
+-   36 patients
+
+-   21,755 genes
+
+```{r eGSE14328, warning = FALSE, message = FALSE  }
+eGSE14328 <- exprs(gse14328)
+eGSE14328 = eGSE14328[rownames(fGSE14328),]
+# remove constant gene expressions
+eGSE14328 = eGSE14328[apply(eGSE14328, 1, 
+                            function(x) length(unique(x)) > 1),]
+#using limma(DE) to get the significant duplicates 
+eGSE14328 = limma_duplicates(eGSE14328, fGSE14328, pGSE14328)
+```
+
+### GSE75693
+
+**Originally:**
+
+-   79 patients
+
+-   54,675 genes
+
+```{r GSE75693, warning = FALSE, message = FALSE  }
+GSE75693   <- getGEO("GSE75693", GSEMatrix = TRUE)[[1]]
+```
+
+#### pData
+
+-   15 rejected patients
+
+-   30 stable patients
+
+```{r pGSE75693, warning = FALSE, message = FALSE  }
+pGSE75693    <- pData(GSE75693)  |> as.data.frame()
+#1a. Convert to tibble, ensure column names are snake_case
+pGSE75693 = pGSE75693 |>  
+  clean_names()
+#1b. Remove constant and contact/file columns
+pGSE75693 <- pGSE75693 |>
+  remove_constant() |>
+  select(
+    -starts_with("contact_"),
+    -any_of(c("submission_date", "last_update_date",
+              "data_processing", "supplementary_file"))
+  )
+#1c. Define outcome and record original label as outcome_type
+pGSE75693 <- pGSE75693 |> 
+  filter(source_name_ch1 %in% c('Stable graft', 'Acute rejection biopsy'))
+pGSE75693$outcome = ifelse(pGSE75693$source_name_ch1 == 'Stable graft',
+                           'stable', 'reject') |> 
+  factor(levels = c('stable', 'reject'))
+pGSE75693 = pGSE75693 |> select(c(geo_accession, outcome))
+```
+
+#### fData
+
+```{r fGSE75693, warning = FALSE, message = FALSE  }
+fGSE75693    <- fData(GSE75693)  |> as.data.frame()
+fGSE75693 <- fGSE75693 |>
+  remove_constant() |> 
+  select(ID, `Gene Symbol`) |> 
+  filter(`Gene Symbol` != '')
+fGSE75693$gene_symbols = str_split(fGSE75693$`Gene Symbol`, '///') |> 
+  sapply(function(x) str_trim(x[1]))
+fGSE75693 = fGSE75693 |> select(-`Gene Symbol`)
+```
+
+#### eMat
+
+**After cleaning:**
+
+-   45 patients
+
+-   22,880 genes
+
+```{r eGSE75693, warning = FALSE, message = FALSE  }
+eGSE75693  <- exprs(GSE75693)
+# 3. expression matrix cleaning
+eGSE75693 = eGSE75693[rownames(fGSE75693), rownames(pGSE75693)]
+# remove constant gene expressions
+eGSE75693 = eGSE75693[apply(eGSE75693, 1, 
+                            function(x) length(unique(x)) > 1),]
+eGSE75693 = limma_duplicates(eGSE75693, fGSE75693, pGSE75693)
+```
+
+### GSE34437
+
+**Originally:**
+
+-   66 patients
+
+-   54,675 genes
+
+```{r GSE34437, warning = FALSE, message = FALSE  }
+GSE34437   <- getGEO("GSE34437", GSEMatrix = TRUE)[[1]]
+```
+
+#### pData
+
+-   50 rejected patients
+
+-   16 stable patients
+
+```{r pGSE34437, warning = FALSE, message = FALSE  }
+pGSE34437    <- pData(GSE34437)  |> as.data.frame()
+#1a. Ensure 'geo_accession' is an explicit column and standardize names
+pGSE34437 <- pGSE34437 |> clean_names() |> remove_constant()
+pGSE34437$outcome = ifelse(pGSE34437$disease_status_ch1 == 'no significant abnormalities', 'stable', 'reject') |> factor(levels = c('stable', 'reject'))
+pGSE34437 = pGSE34437 |> select(c(geo_accession, outcome))
+```
+
+#### fData
+
+```{r fGSE34437, warning = FALSE, message = FALSE  }
+fGSE34437    <- fData(GSE34437)  |> as.data.frame()
+fGSE34437 = fGSE34437 |> remove_constant() |> filter(`Gene Symbol` != '')
+fGSE34437$gene_symbols = str_split(fGSE34437$`Gene Symbol`, '///') |> 
+  sapply(function(x) str_trim(x[1]))
+fGSE34437 = fGSE34437 |> select(c(ID, gene_symbols))
+```
+
+#### eMat
+
+**After cleaning:**
+
+-   66 patients
+
+-   22,880 genes
+
+```{r eGSE34437, warning = FALSE, message = FALSE  }
+eGSE34437  <- exprs(GSE34437)
+eGSE34437 = eGSE34437[rownames(fGSE34437), rownames(pGSE34437)]
+# remove constant gene expressions
+eGSE34437 = eGSE34437[apply(eGSE34437, 1, 
+                            function(x) length(unique(x)) > 1),]
+eGSE34437 = limma_duplicates(eGSE34437, fGSE34437, pGSE34437)
+```
+
+### GSE276194
+
+**Originally:**
+
+-   30 patients
+
+-   49,395 genes
+
+```{r GSE276194, warning = FALSE, message = FALSE  }
+GSE276194  <- getGEO("GSE276194", GSEMatrix = TRUE)[[1]]
+```
+
+#### pData
+
+-   5 rejected patients
+
+-   25 stable patients
+
+```{r pGSE276194, warning = FALSE, message = FALSE  }
+pGSE276194   <- pData(GSE276194)  |> as.data.frame()
+#Ensure geo_accession is a column and standardize names
+pGSE276194 = pGSE276194 |> remove_constant()
+pGSE276194$outcome = ifelse(str_detect(pattern = 'No-rejection',
+                                       pGSE276194$source_name_ch1),
+                            'stable', 'reject') |> 
+  factor(levels = c('stable', 'reject'))
+pGSE276194 = pGSE276194 |> select(c(geo_accession, outcome))
+```
+
+#### fData
+
+```{r fGSE276194, warning = FALSE, message = FALSE  }
+fGSE276194   <- fData(GSE276194)  |> as.data.frame()
+fGSE276194 = fGSE276194 |> remove_constant() |> 
+  filter(`Gene Symbol` != '') |> 
+  filter(`Gene Symbol` != '---')
+fGSE276194$gene_symbols = str_split(fGSE276194$`Gene Symbol`, '///') |> 
+  sapply(function(x) str_trim(x[1]))
+fGSE276194 = fGSE276194 |> select(c(ID, gene_symbols))
+```
+
+#### eMat
+
+**After cleaning:**
+
+-   30 patients
+
+-   19,460 genes
+
+```{r eGSE276194, warning = FALSE, message = FALSE  }
+eGSE276194 <- exprs(GSE276194)
+eGSE276194 = eGSE276194[rownames(fGSE276194), rownames(pGSE276194)]
+# remove constant gene expressions
+eGSE276194 = eGSE276194[apply(eGSE276194, 1, 
+                            function(x) length(unique(x)) > 1),]
+eGSE276194 = limma_duplicates(eGSE276194, fGSE276194, pGSE276194)
+```
+
+### GSE76882
+
+**Originally:**
+
+-   274 patients
+
+-   17,564 genes
+
+```{r GSE76882, warning = FALSE, message = FALSE  }
+GSE76882   <- getGEO("GSE76882", GSEMatrix = TRUE)[[1]]
+```
+
+#### pData
+
+-   83 rejected patients
+
+-   181 stable patients
+
+```{r pGSE76882, warning = FALSE, message = FALSE  }
+pGSE76882    <- pData(GSE76882)  |> as.data.frame()
+pGSE76882 = pGSE76882 |> remove_constant()
+pGSE76882 = pGSE76882 |> filter(!str_detect(`disease state:ch1`, 'IFTA_i'))
+pGSE76882$outcome = ifelse(str_detect(pGSE76882$`disease state:ch1`, 'AR'),
+                           'reject', 'stable') |> 
+  factor(levels = c('stable', 'reject'))
+pGSE76882 = pGSE76882 |> select(c(geo_accession, outcome))
+```
+
+#### fData
+
+```{r fGSE76882, warning = FALSE, message = FALSE  }
+fGSE76882    <- fData(GSE76882)  |> as.data.frame()
+fGSE76882 = fGSE76882 |> remove_constant() |> filter(`Gene Symbol` != '')
+fGSE76882$gene_symbols = str_split(fGSE76882$`Gene Symbol`, '///') |> 
+  sapply(function(x) str_trim(x[1]))
+fGSE76882 = fGSE76882 |> select(c(ID, gene_symbols))
+```
+
+#### eMat
+
+-   264 patients
+
+-   17,263 genes
+
+```{r eGSE76882, warning = FALSE, message = FALSE  }
+eGSE76882  <- exprs(GSE76882)
+eGSE76882 = eGSE76882[rownames(fGSE76882), rownames(pGSE76882)]
+# remove constant gene expressions
+eGSE76882 = eGSE76882[apply(eGSE76882, 1, 
+                            function(x) length(unique(x)) > 1),]
+eGSE76882 = limma_duplicates(eGSE76882, fGSE76882, pGSE76882)
+```
+
+### GSE19130
+
+**Originally:**
+
+-   119 patients
+
+-   1,347 genes
+
+```{r GSE19130, warning = FALSE, message = FALSE  }
+GSE19130 = getGEO('GSE19130', GSEMatrix = TRUE)
+GSE19130 = GSE19130[[1]]
+```
+
+#### pData
+
+-   62 rejected patients
+
+-   57 stable patients
+
+```{r pGSE1913, warning = FALSE, message = FALSE  }
+pGSE19130 = pData(GSE19130)
+pGSE19130 = pGSE19130 |> remove_constant()
+pGSE19130$outcome = ifelse(
+  pGSE19130$`state:ch1` %in% c('acute rejection', 'borderline change', 'presumed rejection'),
+  'reject', 'stable') |> 
+  factor(levels = c('stable', 'reject'))
+pGSE19130 = pGSE19130 |> select(c(geo_accession, outcome))
+```
+
+#### fData
+
+```{r fGSE19130, warning = FALSE, message = FALSE  }
+fGSE19130 = fData(GSE19130)
+fGSE19130$gene_symbols = fGSE19130$Gene
+fGSE19130 = fGSE19130 |> select(ID, gene_symbols)
+```
+
+#### eMat
+
+-   119 patients
+
+-   448 genes
+
+```{r eGSE19130, warning = FALSE, message = FALSE  }
+eGSE19130 = exprs(GSE19130)
+eGSE19130 = eGSE19130[rownames(fGSE19130), rownames(pGSE19130)]
+# remove constant gene expressions
+eGSE19130 = eGSE19130[apply(eGSE19130, 1, 
+                            function(x) length(unique(x)) > 1),]
+eGSE19130 = limma_duplicates(eGSE19130, fGSE19130, pGSE19130)
+```
+
+### GSE26578
+
+**Originally**
+
+-   113 patients
+
+-   1,347 genes
+
+```{r GSE26578, warning = FALSE, message = FALSE  }
+GSE26578 = getGEO('GSE26578', GSEMatrix = TRUE)
+GSE26578 = GSE26578[[1]]
+```
+
+#### pData
+
+-   34 rejected patients
+
+-   61 stable patients
+
+```{r pGSE26578, warning = FALSE, message = FALSE  }
+pGSE26578 = pData(GSE26578)
+pGSE26578 = pGSE26578 |> remove_constant() |> 
+  filter(!str_detect(`disease status:ch1`, 'dysfunction'))
+pGSE26578$outcome = ifelse(
+  pGSE26578$`disease status:ch1` == 'acute rejection', 'reject', 'stable') |> 
+  factor(levels = c('stable', 'reject'))
+pGSE26578 = pGSE26578 |> select(c(geo_accession, outcome))
+```
+
+#### fData
+
+```{r fGSE26578, warning = FALSE, message = FALSE  }
+fGSE26578 = fData(GSE26578)
+fGSE26578$gene_symbols = fGSE26578$Gene
+fGSE26578 = fGSE26578 |> select(c(ID, gene_symbols))
+```
+
+#### eMat
+
+**After cleaning:**
+
+-   95 patients
+
+-   448 genes
+
+```{r eGSE26578, warning = FALSE, message = FALSE  }
+eGSE26578 = exprs(GSE26578)
+eGSE26578 = eGSE26578[rownames(fGSE26578), rownames(pGSE26578)]
+# remove constant gene expressions
+eGSE26578 = eGSE26578[apply(eGSE26578, 1, 
+                            function(x) length(unique(x)) > 1),]
+eGSE26578 = limma_duplicates(eGSE26578, fGSE26578, pGSE26578)
+```
+
+### GSE9493
+
+**Originally:**
+
+-   82 patients
+
+-   54,675 genes
+
+```{r GSE9493, warning = FALSE, message = FALSE  }
+GSE9493 = getGEO('GSE9493', GSEMatrix = TRUE)
+GSE9493 = GSE9493[[1]]
+```
+
+#### pData
+
+-   21 rejected patients
+
+-   61 stable patients
+
+```{r pGSE9493, warning = FALSE, message = FALSE  }
+pGSE9493 = pData(GSE9493)
+pGSE9493 = pGSE9493 |> remove_constant()
+pGSE9493$outcome = ifelse(str_detect(pGSE9493$source_name_ch1, 'rejection'),
+                          'reject', 'stable') |> 
+  factor(levels = c('stable', 'reject'))
+pGSE9493 = pGSE9493 |> select(c(geo_accession, outcome))
+```
+
+#### fData
+
+```{r fGSE9493, warning = FALSE, message = FALSE  }
+fGSE9493 = fData(GSE9493)
+fGSE9493 = fGSE9493 |> remove_constant() |> filter(`Gene Symbol` != '')
+fGSE9493$gene_symbols = str_split(fGSE9493$`Gene Symbol`, '///') |> 
+  sapply(function(x) str_trim(x[1]))
+fGSE9493 = fGSE9493 |> select(c(ID, gene_symbols))
+```
+
+#### eMat
+
+**After cleaning:**
+
+-   82 patients
+
+-   22,880 genes
+
+```{r eGSE9493, warning = FALSE, message = FALSE  }
+eGSE9493 = exprs(GSE9493)
+eGSE9493 = eGSE9493[rownames(fGSE9493), rownames(pGSE9493)]
+eGSE9493 = eGSE9493 |> na.omit()
+fGSE9493 = fGSE9493[rownames(eGSE9493),]
+# remove constant gene expressions
+eGSE9493 = eGSE9493[apply(eGSE9493, 1,
+                          function(x) length(unique(x)) > 1),]
+eGSE9493 = limma_duplicates(eGSE9493, fGSE9493, pGSE9493)
+eGSE9493 = (eGSE9493 + 1) |> log2()
+```
+
+### GSE107503
+
+**Originally:**
+
+-   530 patients
+
+-   54,715 genes
+
+```{r GSE107503, warning = FALSE, message = FALSE  }
+GSE107503 = getGEO('GSE107503', GSEMatrix = TRUE)
+GSE107503 = GSE107503[[1]]
+```
+
+#### pData
+
+-   130 rejected patients
+
+-   400 stable patients
+
+```{r pGSE107503, warning = FALSE, message = FALSE  }
+pGSE107503 = pData(GSE107503)
+pGSE107503 = pGSE107503 |> remove_constant()
+pGSE107503$outcome = ifelse(
+  str_detect(pGSE107503$`phenotype:ch1`, 'acute rejection'), 
+  'reject', 'stable') |> 
+  factor(levels = c('stable', 'reject'))
+pGSE107503 = pGSE107503 |> select(c(geo_accession, outcome))
+```
+
+#### fData
+
+```{r fGSE107503, warning = FALSE, message = FALSE  }
+fGSE107503 = fData(GSE107503)
+fGSE107503 = fGSE107503 |> remove_constant() |> filter(`Gene Symbol` != '')
+fGSE107503$gene_symbols = str_split(fGSE107503$`Gene Symbol`, '///') |> 
+  sapply(function(x) str_trim(x[1]))
+fGSE107503 = fGSE107503 |> select(c(ID, gene_symbols))
+```
+
+#### eMat
+
+**After cleaning:**
+
+-   530 patients
+
+-   20,277 genes
+
+```{r eGSE107503, warning = FALSE, message = FALSE  }
+eGSE107503 = exprs(GSE107503)
+eGSE107503 = eGSE107503[rownames(fGSE107503), rownames(pGSE107503)]
+# remove constant gene expressions
+eGSE107503 = eGSE107503[apply(eGSE107503, 1, 
+                            function(x) length(unique(x)) > 1),]
+eGSE107503 = limma_duplicates(eGSE107503, fGSE107503, pGSE107503)
+```
+
+### GSE1563
+
+#### pData
+
+-   7 rejected patients
+
+-   15 stable patients
+
+```{r pGSE1563_biopsy, warning = FALSE, message = FALSE  }
+# extract samples with blood test result
+pGSE1563 = pGSE1563_both |> filter(source_name_ch1 == 'kidney')
+# retain patients' IDs and outcomes
+pGSE1563 = pGSE1563 |> select(geo_accession, outcome)
+```
+
+#### eMat
+
+**After cleaning:**
+
+-   22 patients
+
+-   9,085 genes
+
+```{r eGSE1563_biopsy, warning = FALSE, message = FALSE  }
+# retain only observations of genes included in the fdata from blood samples
+eGSE1563 = eGSE1563_both[rownames(fGSE1563), rownames(pGSE1563)]
+# remove constant gene expressions
+eGSE1563 = eGSE1563[apply(eGSE1563, 1, 
+                          function(x) length(unique(x)) > 1),]
+# run limma to remove duplicated gene symbols
+eGSE1563 = limma_duplicates(eGSE1563, fGSE1563, pGSE1563)
+eGSE1563 = (eGSE1563 + 1) |> log2()
+```
+
+### GSE50084
+
+#### pData
+
+-   28 rejected patients
+
+-   33 stable patients
+
+```{r pGSE50084_biopsy, warning = FALSE, message = FALSE  }
+# separate the biopsy samples from the blood samples
+pGSE50084 = pGSE50084_both |> 
+  filter(`tissue:ch1` == 'biopsy') |> 
+  select(c(geo_accession, outcome))
+```
+
+#### eMat
+
+**After cleaning:**
+
+-   61 patients
+
+-   23,307 genes
+
+```{r eGSE50084_biopsy, warning = FALSE, message = FALSE  }
+# filter out genes not recorded in fdata and samples not from blood test
+eGSE50084 = eGSE50084_both[rownames(fGSE50084), rownames(pGSE50084)]
+# remove constant gene expressions
+eGSE50084 = eGSE50084[apply(eGSE50084, 1, 
+                            function(x) length(unique(x)) > 1),]
+# run limma to get rid of duplicated gene symbols
+eGSE50084 = limma_duplicates(eGSE50084, fGSE50084, pGSE50084)
+```
+
+## Data Merging
+
+-   `GSE50084` was randomly chosen as the left-out test set
+
+### Decision making with fewer-gene datasets
+
+#### Desirable genes to retain
+
+```{r biopsy_retained_genes, warning = FALSE, message = FALSE  }
+# extract outcome for the 8-dataset merge
+outcome_retained = c(pGSE107503$outcome,
+                     pGSE138043$outcome,
+                     pGSE14328$outcome,
+                     pGSE276194$outcome,
+                     pGSE34437$outcome,
+                     pGSE75693$outcome,
+                     pGSE76882$outcome,
+                     pGSE9493$outcome) |> 
+  factor(levels = c('stable', 'reject'))
+# find the common genes across the 8 datasets
+common_genes_retained = intersect(rownames(eGSE107503), rownames(eGSE138043))
+common_genes_retained = intersect(common_genes_retained, rownames(eGSE14328))
+common_genes_retained = intersect(common_genes_retained, rownames(eGSE276194))
+common_genes_retained = intersect(common_genes_retained, rownames(eGSE34437))
+common_genes_retained = intersect(common_genes_retained, rownames(eGSE75693))
+common_genes_retained = intersect(common_genes_retained, rownames(eGSE76882))
+common_genes_retained = intersect(common_genes_retained, rownames(eGSE9493))
+# retain only the common genes in each individual dataset
+eGSE107503_subset_retained = eGSE107503[which(
+  rownames(eGSE107503) %in% common_genes_retained),]
+eGSE138043_subset_retained = eGSE138043[which(
+  rownames(eGSE138043) %in% common_genes_retained),]
+eGSE14328_subset_retained = eGSE14328[which(
+  rownames(eGSE14328) %in% common_genes_retained),]
+eGSE276194_subset_retained = eGSE276194[which(
+  rownames(eGSE276194) %in% common_genes_retained),]
+eGSE34437_subset_retained = eGSE34437[which(
+  rownames(eGSE34437) %in% common_genes_retained),]
+eGSE75693_subset_retained = eGSE75693[which(
+  rownames(eGSE75693) %in% common_genes_retained),]
+eGSE76882_subset_retained = eGSE76882[which(
+  rownames(eGSE76882) %in% common_genes_retained),]
+eGSE9493_subset_retained = eGSE9493[which(
+  rownames(eGSE9493) %in% common_genes_retained),]
+# order the individual expression matrices so that they are in the same order regarding gene symbols
+eGSE107503_ordered_retained = eGSE107503_subset_retained[match(
+  common_genes_retained, rownames(eGSE107503_subset_retained)),]
+eGSE138043_ordered_retained = eGSE138043_subset_retained[match(
+  common_genes_retained, rownames(eGSE138043_subset_retained)),]
+eGSE14328_ordered_retained = eGSE14328_subset_retained[match(
+  common_genes_retained, rownames(eGSE14328_subset_retained)),]
+eGSE276194_ordered_retained = eGSE276194_subset_retained[match(
+  common_genes_retained, rownames(eGSE276194_subset_retained)),]
+eGSE34437_ordered_retained = eGSE34437_subset_retained[match(
+  common_genes_retained, rownames(eGSE34437_subset_retained)),]
+eGSE75693_ordered_retained = eGSE75693_subset_retained[match(
+  common_genes_retained, rownames(eGSE75693_subset_retained)),]
+eGSE76882_ordered_retained = eGSE76882_subset_retained[match(
+  common_genes_retained, rownames(eGSE76882_subset_retained)),]
+eGSE9493_ordered_retained = eGSE9493_subset_retained[match(
+  common_genes_retained, rownames(eGSE9493_subset_retained)),]
+# merge everything naively
+eMat_noBatch_retained = cbind(eGSE107503_ordered_retained,
+                              eGSE138043_ordered_retained,
+                              eGSE14328_ordered_retained,
+                              eGSE276194_ordered_retained,
+                              eGSE34437_ordered_retained,
+                              eGSE75693_ordered_retained,
+                              eGSE76882_ordered_retained,
+                              eGSE9493_ordered_retained)
+# batch factor
+batch_retained = c(rep(1, nrow(pGSE107503)),
+                   rep(2, nrow(pGSE138043)),
+                   rep(3, nrow(pGSE14328)),
+                   rep(4, nrow(pGSE276194)),
+                   rep(5, nrow(pGSE34437)),
+                   rep(6, nrow(pGSE75693)),
+                   rep(7, nrow(pGSE76882)),
+                   rep(8, nrow(pGSE9493)))
+# batch correct
+eMat_retained = ComBat(eMat_noBatch_retained, batch_retained)
+# run limma
+design = model.matrix(~outcome_retained)
+fit = lmFit(eMat_retained, design) |> eBayes()
+# extract statistically differential genes whose adj.P.Val < 0.01
+significant_genes = topTable(fit, n = Inf) |> filter(adj.P.Val < 0.01)
+```
+
+#### Consider GSE19130
+
+```{r GSE19130_percent_retained, warning = FALSE, message = FALSE  }
+# check how many of the above significant genes are included
+sum(rownames(significant_genes) %in% rownames(eGSE19130))/nrow(significant_genes)
+```
+
+-   Only 4.34% of the above significant genes (i.e. 216 differential genes) are retained
+
+-   Therefore, we decided to get rid of this dataset
+
+#### Consider GSE26578
+
+```{r GSE26578_percent_retained, warning = FALSE, message = FALSE  }
+# check how many of the above significant genes are included
+sum(rownames(significant_genes) %in% rownames(eGSE26578))/nrow(significant_genes)
+```
+
+-   Similar to GSE19130, we decided to exclude GSE26578 as it's dropping too many significant genes
+
+#### Considering GSE1563
+
+```{r GSE1563_percent_retained, warning = FALSE, message = FALSE  }
+# check how many of the above significant genes are included
+sum(rownames(significant_genes) %in% rownames(eGSE1563))/nrow(significant_genes)
+(rownames(significant_genes) %in% rownames(eGSE1563)) |> sum()
+```
+
+-   GSE1563 contains more than 50% of the above differential genes, which is 2,921 in total
+
+-   Hence, we decided to include this dataset in the analysis
+
+#### Considering GSE53605
+
+```{r GSE53605_percent_retained, warning = FALSE, message = FALSE  }
+# check how many of the above significant genes are included
+sum(rownames(significant_genes) %in% rownames(eGSE53605))/nrow(significant_genes)
+sum(rownames(significant_genes) %in% rownames(eGSE53605))
+```
+
+-   Roughly 79% of the above desirable genes are included in GSE53605. Hence, we decided to retain it in our analysis
+
+### Train set
+
+#### `y_train` *(merged pData)*
+
+##### Merge
+
+```{r biopsy_y_train, warning = FALSE, message = FALSE  }
+y_train = rbind(pGSE107503, pGSE138043)
+y_train = rbind(y_train, pGSE14328)
+y_train = rbind(y_train, pGSE1563)
+y_train = rbind(y_train, pGSE34437)
+y_train = rbind(y_train, pGSE276194)
+y_train = rbind(y_train, pGSE53605)
+y_train = rbind(y_train, pGSE75693)
+y_train = rbind(y_train, pGSE76882)
+y_train = rbind(y_train, pGSE9493)
+
+y_train$original_dataset = c(rep('GSE107503', nrow(pGSE107503)),
+                           rep('GSE138043', nrow(pGSE138043)),
+                           rep('GSE14328', nrow(pGSE14328)),
+                           rep('GSE1563', nrow(pGSE1563)),
+                           rep('GSE34437', nrow(pGSE34437)),
+                           rep('GSE276194', nrow(pGSE276194)),
+                           rep('GSE53605', nrow(pGSE53605)),
+                           rep('GSE75693', nrow(pGSE75693)),
+                           rep('GSE76882', nrow(pGSE76882)),
+                           rep('GSE9493', nrow(pGSE9493)))
+```
+
+##### Split into folds for cross validation
+
+```{r biopsy_cross_validate_folds, warning = FALSE, message = FALSE  }
+set.seed(3888)
+datasets = y_train$original_dataset |> unique()
+folds_number = 5
+y_train$fold = character(length = nrow(y_train))
+row.names(y_train) = c(1:nrow(y_train))
+row_tracker = 0
+for (i in 1:length(datasets)) {
+  X_ind = y_train |> filter(original_dataset == datasets[i])
+  folds = createFolds(X_ind$outcome, k = folds_number,
+                      returnTrain = FALSE)
+  for (j in 1:length(folds)) {
+    y_train$fold[folds[[j]] + row_tracker] = j
+  }
+  row_tracker = row_tracker + nrow(X_ind)
+}
+y_train$fold = factor(y_train$fold)
+```
+
+#### `X_train` *(merged eMat)*
+
+##### Without Batch correction
+
+```{r biopsy_eMat_no_batch, warning = FALSE, message = FALSE  }
+# get a list of genes that all datasets have
+common_genes = intersect(rownames(eGSE107503), rownames(eGSE138043))
+common_genes = intersect(common_genes, rownames(eGSE14328))
+common_genes = intersect(common_genes, rownames(eGSE1563))
+common_genes = intersect(common_genes, rownames(eGSE276194))
+common_genes = intersect(common_genes, rownames(eGSE34437))
+common_genes = intersect(common_genes, rownames(eGSE50084))
+common_genes = intersect(common_genes, rownames(eGSE53605))
+common_genes = intersect(common_genes, rownames(eGSE75693))
+common_genes = intersect(common_genes, rownames(eGSE76882))
+common_genes = intersect(common_genes, rownames(eGSE9493))
+# retain only the genes that all datasets have in each individual dataset
+eGSE107503_subset = eGSE107503[which(
+  rownames(eGSE107503) %in% common_genes),]
+eGSE138043_subset = eGSE138043[which(
+  rownames(eGSE138043) %in% common_genes),]
+eGSE14328_subset = eGSE14328[which(
+  rownames(eGSE14328) %in% common_genes),]
+eGSE1563_subset = eGSE1563[which(
+  rownames(eGSE1563) %in% common_genes),]
+eGSE34437_subset = eGSE34437[which(
+  rownames(eGSE34437) %in% common_genes),]
+eGSE276194_subset = eGSE276194[which(
+  rownames(eGSE276194) %in% common_genes),]
+eGSE53605_subset = eGSE53605[which(
+  rownames(eGSE53605) %in% common_genes),]
+eGSE75693_subset = eGSE75693[which(
+  rownames(eGSE75693) %in% common_genes),]
+eGSE76882_subset = eGSE76882[which(
+  rownames(eGSE76882) %in% common_genes),]
+eGSE9493_subset = eGSE9493[which(
+  rownames(eGSE9493) %in% common_genes),]
+# order the individual expression matrices so that they are in the same order regarding gene symbols
+eGSE107503_ordered = eGSE107503_subset[match(
+  common_genes, rownames(eGSE107503_subset)),]
+eGSE138043_ordered = eGSE138043_subset[match(
+  common_genes, rownames(eGSE138043_subset)),]
+eGSE14328_ordered = eGSE14328_subset[match(
+  common_genes, rownames(eGSE14328_subset)),]
+eGSE1563_ordered = eGSE1563_subset[match(
+  common_genes, rownames(eGSE1563_subset)),]
+eGSE34437_ordered = eGSE34437_subset[match(
+  common_genes, rownames(eGSE34437_subset)),]
+eGSE276194_ordered = eGSE276194_subset[match(
+  common_genes, rownames(eGSE276194_subset)),]
+eGSE53605_ordered = eGSE53605_subset[match(
+  common_genes, rownames(eGSE53605_subset)),]
+eGSE75693_ordered = eGSE75693_subset[match(
+  common_genes, rownames(eGSE75693_subset)),]
+eGSE76882_ordered = eGSE76882_subset[match(
+  common_genes, rownames(eGSE76882_subset)),]
+eGSE9493_ordered = eGSE9493_subset[match(
+  common_genes, rownames(eGSE9493_subset)),]
+# merge everything without the batch effect
+X_train = cbind(eGSE107503_ordered,
+                     eGSE138043_ordered,
+                     eGSE14328_ordered,
+                     eGSE1563_ordered,
+                     eGSE34437_ordered,
+                     eGSE276194_ordered,
+                     eGSE53605_ordered,
+                     eGSE75693_ordered,
+                     eGSE76882_ordered,
+                     eGSE9493_ordered) |> 
+  data.frame()
+# pca graph of the merged dataset without combat, colouring by original dataset
+pca = prcomp(t(X_train), center = TRUE, scale. = TRUE)
+p1 = pca$x |> 
+  data.frame() |> 
+  mutate(dataset = c(rep('GSE107503', nrow(pGSE107503)),
+                     rep('GSE138043', nrow(pGSE138043)),
+                     rep('GSE14328', nrow(pGSE14328)),
+                     rep('GSE1563', nrow(pGSE1563)),
+                     rep('GSE34437', nrow(pGSE34437)),
+                     rep('GSE276194', nrow(pGSE276194)),
+                     rep('GSE53605', nrow(pGSE53605)),
+                     rep('GSE75693', nrow(pGSE75693)),
+                     rep('GSE76882', nrow(pGSE76882)),
+                     rep('GSE9493', nrow(pGSE9493)))) |> 
+  ggplot(aes(x = PC1, y= PC2, color = dataset)) +
+  geom_point(size = 3) + theme_bw()
+```
+
+##### With Batch correction
+
+```{r biopsy_eMat_batch, warning = FALSE, message = FALSE  }
+# number each sample by the dataset they come from
+batch = c(rep(1, ncol(eGSE107503)),
+          rep(2, ncol(eGSE138043)),
+          rep(3, ncol(eGSE14328)),
+          rep(4, ncol(eGSE1563)),
+          rep(8, ncol(eGSE34437)),
+          rep(9, ncol(eGSE276194)),
+          rep(10, ncol(eGSE53605)),
+          rep(11, ncol(eGSE75693)),
+          rep(12, ncol(eGSE76882)),
+          rep(13, ncol(eGSE9493)))
+# merge the dataset with batch effect fixing
+eMat_batch = ComBat(dat = X_train,
+                    batch = batch,
+                    mod = NULL,
+                    par.prior = TRUE,
+                    prior.plots = FALSE)
+# graph pca for batch effect visualized
+pca_combat = prcomp(t(eMat_batch), center = TRUE, scale. = TRUE)
+p2 = pca_combat$x |> 
+  data.frame() |> 
+  mutate(dataset = c(rep('GSE107503', nrow(pGSE107503)),
+                     rep('GSE138043', nrow(pGSE138043)),
+                     rep('GSE14328', nrow(pGSE14328)),
+                     rep('GSE1563', nrow(pGSE1563)),
+                     rep('GSE34437', nrow(pGSE34437)),
+                     rep('GSE276194', nrow(pGSE276194)),
+                     rep('GSE53605', nrow(pGSE53605)),
+                     rep('GSE75693', nrow(pGSE75693)),
+                     rep('GSE76882', nrow(pGSE76882)),
+                     rep('GSE9493', nrow(pGSE9493)))) |> 
+  ggplot(aes(x = PC1, y = PC2, color = dataset)) +
+  geom_point(size = 3) + theme_bw()
+```
+
+##### Batch correction effect
+
+```{r biopsy_batch_compare, warning = FALSE, message = FALSE  }
+ggarrange(p1, p2, ncol = 2, nrow = 1, common.legend = TRUE, legend = 'right')
+```
+
+#### Overview
+
+-   1,182 patients
+
+    -   381 rejected patients
+
+    -   801 stable patients
+
+-   7,065 genes
+
+### Test set
+
+#### `y_test` *(test set pData)*
+
+```{r biopsy_y_test, warning = FALSE, message = FALSE  }
+y_test = pGSE50084
+```
+
+#### `X_test` *(test set eMat)*
+
+```{r biopsy_x_test, warning = FALSE, message = FALSE  }
+# exclude any genes that are not included in the train data
+X_test = eGSE50084[which(rownames(eGSE50084) %in% common_genes),]
+# rearrange to match the gene order of the train data
+X_test = X_test[match(common_genes, rownames(X_test)),]
+```
+
+#### Overview
+
+-   61 patients
+
+    -   28 rejected patients
+
+    -   33 stable patients
+
+-   7,065 genes
+
+## Feature Selection
+
+```{r biopsy_best_fs, warning = FALSE, message = FALSE}
+# a data frame to store the performance of the models after hyper parameters are fine tuned
+best_avg_perf = vector('list', length = 7)
+```
+
+### Limma
+
+```{r biopsy_limma, warning = FALSE, message = FALSE  }
+# the number of significant genes to choose from
+n_vals = c(10, 25, 50, 75, 100, 150, 200, 250, 300, 400, 500)
+limma_perf = vector('list', length = 5 * length(n_vals))
+index = 1
+# create a loop for cross validation
+for (i in c(1:5)) {
+  # preprocess
+  preproc = fs_preproc(test_fold = i)
+  cv_x_train = preproc$x_train
+  cv_x_test = preproc$x_test
+  cv_y_train = preproc$y_train
+  cv_y_test = preproc$y_test
+  # feature selection (limma in this example)
+  design = model.matrix(~cv_y_train$outcome)
+  fit = lmFit(cv_x_train, design) |> eBayes()
+  rank = topTable(fit, n = Inf)
+  # loop through each possible n values
+  for (n in n_vals){
+    # select n top genes
+    de = rownames(rank)[1:n]
+    # include only n top genes in the training and the test fold
+    cv_train_reduced = cv_x_train[de,]
+    cv_test_reduced = cv_x_test[de,]
+    # random forest built on training fold
+    rf = randomForest(x = t(cv_train_reduced), y = cv_y_train$outcome)
+    # evaluate model performance on the test fold
+    pred_prob = predict(rf, t(cv_test_reduced), type = 'prob')[, 'reject']
+    pred_class = ifelse(pred_prob > 0.5, 'reject', 'stable') |> 
+      factor(levels = c('stable', 'reject'))
+    # roc object to calculate auc
+    roc_obj = roc(response = cv_y_test$outcome, predictor = pred_prob)
+    # extract model performance and store it in the comparison table
+    limma_perf[[index]] = data.frame(gene_number = n,
+                                     auc = auc(roc_obj) |> as.numeric())
+    index = index + 1
+  }
+}
+# calculate the overall performance of each n value
+limma_perf = limma_perf |> bind_rows() |> drop_na()
+limma_rank = limma_perf |> 
+  group_by(gene_number) |> 
+  summarise(mean_auc = mean(auc)) |> 
+  arrange(desc(mean_auc))
+# visualize the performance of each n
+limma_rank_long = limma_rank |> 
+  pivot_longer(cols = mean_auc, names_to = 'metric', values_to = 'value')
+(ggplot(data = limma_rank_long, 
+        aes(x = gene_number, y = value)) +
+    geom_line() + 
+    labs(x = 'Number of genes', y = 'Area Under the Curve (AUC)', title = 'Performance of Limma with different numbers of genes on Biopsy data') + 
+    theme_bw()) |> 
+  ggplotly()
+limma_rank |> datatable(colnames = c('Gene number', 'Mean AUC'))
+# optimal n
+best_avg_perf[[1]] = data.frame(method = rep('Limma', 5),
+                                limma_perf |> 
+                                  filter(gene_number == 250))
+```
+
+### Mutual Information
+
+```{r biopsy_mutual_information, warning = FALSE, message = FALSE  }
+# storage for performance per cross validation
+mi_perf = vector('list', length = 5 * length(n_vals))
+index = 1
+# create a loop for cross validation
+for (i in c(1:5)) {
+  preproc = fs_preproc(test_fold = i)
+  cv_x_train = preproc$x_train
+  cv_x_test = preproc$x_test
+  cv_y_train = preproc$y_train
+  cv_y_test = preproc$y_test
+  # rank genes based on their mi score
+  rank = mi_score(cv_x_train, cv_y_train)
+  # loop through each possible n values
+  for (n in n_vals){
+    # select n top genes
+    de = rank[1:n]
+    # include only n top genes in the training and the test fold
+    cv_x_train_reduced = cv_x_train[de,]
+    cv_x_test_reduced = cv_x_test[de,]
+    # random forest built on training fold
+    rf = randomForest(x = t(cv_x_train_reduced), y = cv_y_train$outcome)
+    # evaluate model performance on the test fold
+    pred_prob = predict(rf, t(cv_x_test_reduced), type = 'prob')[,'reject']
+    roc_obj = roc(response = cv_y_test$outcome, predictor = pred_prob)
+    # extract model performance and store it in the comparison table
+    mi_perf[[index]] = data.frame(gene_number = n,
+                                  auc = auc(roc_obj) |> as.numeric())
+    index = index + 1
+  }
+}
+# calculate the overall performance of each n value
+mi_perf = mi_perf |> bind_rows() |> drop_na()
+mi_rank = mi_perf |>  
+  group_by(gene_number) |> 
+  summarise(mean_auc = mean(auc)) |> 
+  arrange(desc(mean_auc))
+# visualize the performance of each n
+mi_rank_long = mi_rank |> 
+  pivot_longer(cols = mean_auc, names_to = 'metric', values_to = 'value')
+(ggplot(data = mi_rank_long, aes(x = gene_number, y = value)) +
+    geom_line() + 
+    labs(x = 'Gene number', y = 'Area Under the Curve (AUC)', title = 'Performance of Mutual Information with different numbers of genes on Biopsy data') + 
+    theme_bw()) |> 
+  ggplotly()
+mi_rank |> datatable(colnames = c('Gene number', 'Mean AUC'))
+# save the optimal n value
+best_avg_perf[[2]] = data.frame(
+  method = rep('MI', 5),
+  mi_perf |> filter(gene_number == 200))
+```
+
+### Fisher score
+
+```{r biopsy_fisher_score, warning = FALSE, message = FALSE  }
+fisher_perf = vector('list', length = 5 * length(n_vals))
+index = 1
+# loop to do cross validation
+for (i in c(1:5)) {
+  preproc = fs_preproc(test_fold = i)
+  cv_x_train = preproc$x_train
+  cv_x_test = preproc$x_test
+  cv_y_train = preproc$y_train
+  cv_y_test = preproc$y_test
+  fisher_scores = fisher_score(cv_x_train %>% as.matrix(), cv_y_train)
+  # calculate fisher scores from the train folds
+  rank = fisher_scores |> rownames()
+  for (n in n_vals) {
+    # select top n genes
+    de = rank[1:n]
+    cv_train_reduced = cv_x_train[de,]
+    cv_test_reduced = cv_x_test[de,]
+    # build a random forest to evaluate performance
+    rf = randomForest(t(cv_train_reduced), cv_y_train$outcome)
+    pred_prob = predict(rf, t(cv_test_reduced), type = 'prob')[,'reject']
+    roc_obj = roc(response = cv_y_test$outcome, predictor = pred_prob)
+    # extract the recall rate
+    fisher_perf[[index]] = data.frame(gene_number = n,
+                                      auc = auc(roc_obj) |> as.numeric())
+    index = index + 1
+  }
+}
+# calculate the overall performance of each n value
+fisher_perf = fisher_perf |> bind_rows() |> drop_na()
+fisher_rank = fisher_perf |> 
+  group_by(gene_number) |> 
+  summarise(mean_auc = mean(auc)) |> 
+  arrange(desc(mean_auc))
+# visualize the performance of each n
+fisher_rank_long = fisher_rank |> 
+  pivot_longer(cols = mean_auc, names_to = 'metric', values_to = 'value')
+(ggplot(data = fisher_rank_long, aes(x = gene_number, y = value)) +
+    geom_line() + 
+    labs(x = 'Gene number', y = 'Area Under the Curve (AUC)', title = 'Performance of Fisher score with different numbers of genes on Biopsy data') + 
+    theme_bw()) |> 
+  ggplotly()
+fisher_rank |> datatable(colnames = c('Gene number', 'Mean AUC'))
+# retain the best performing n value
+best_avg_perf[[4]] = data.frame(
+  method = rep('Fisher', 5), 
+  fisher_perf |> filter(gene_number == 250))
+```
+
+### T-test
+
+```{r biopsy_t_test, warning = FALSE, message = FALSE  }
+t_test_perf = vector('list', length = 5 * length(n_vals))
+index = 1
+# loop for cross validation
+for (i in c(1:5)) {
+  # train-test folds split
+  preproc = fs_preproc(test_fold = i)
+  cv_x_train = preproc$x_train
+  cv_x_test = preproc$x_test
+  cv_y_train = preproc$y_train
+  cv_y_test = preproc$y_test
+  # perform t test for each gene
+  t_test = apply(cv_x_train, 1, function(gene) {
+    t.test(gene~cv_y_train$outcome)$p.value
+  })
+  # rank the gene based on their p-value
+  rank = data.frame(
+    row.names = rownames(cv_x_train),
+    pval = t_test
+  ) |> arrange(pval)
+  # loop to find the optimal number of significant genes
+  for (n in n_vals) {
+    # select the top n genes
+    de = rownames(rank)[1:n]
+    cv_train_reduced = cv_x_train[de,]
+    cv_test_reduced = cv_x_test[de,]
+    # random forest to evaluate the feature selection method
+    rf = randomForest(t(cv_train_reduced), cv_y_train$outcome)
+    pred_prob = predict(rf, t(cv_test_reduced), type = 'prob')[,'reject']
+    roc_obj = roc(response = cv_y_test$outcome, predictor = pred_prob)
+    # extract the recall rate
+    t_test_perf[[index]] = data.frame(gene_number = n,
+                                      auc = auc(roc_obj) |> as.numeric())
+    index = index + 1
+  }
+}
+# calculate the overall performance of each n value
+t_test_perf = t_test_perf |> bind_rows() |> drop_na()
+t_test_rank = t_test_perf |> 
+  group_by(gene_number) |> 
+  summarise(mean_auc = mean(auc)) |> 
+  arrange(desc(mean_auc))
+# visualize the performance of each n
+t_test_rank_long = t_test_rank |> 
+  pivot_longer(cols = mean_auc, names_to = 'metric', values_to = 'value')
+(ggplot(data = t_test_rank_long, aes(x = gene_number, y = value)) +
+    geom_line() + 
+    labs(x = 'Gene number', y = 'Area Under the Curve (AUC)', title = 'Performance of T-test with different number of genes on Biopsy data') + 
+    theme_bw()) |> 
+  ggplotly()
+t_test_rank |> datatable(colnames = c('Gene number', 'Mean AUC'))
+# retain the best performing n value
+best_avg_perf[[5]] = data.frame(
+  method = rep('T-test', 5),
+  t_test_perf |> filter(gene_number == 400))
+```
+
+### Significance Analysis of Microarrays (SAM)
+
+```{r biopsy_sam, warning = FALSE, message = FALSE  }
+sam_perf = vector('list', length = 5 * length(n_vals))
+index = 1
+# loop to perform cross validation
+for (i in c(1:5)) {
+  # train-test folds split
+  preproc = fs_preproc(test_fold = i)
+  cv_x_train = preproc$x_train
+  cv_x_test = preproc$x_test
+  cv_y_train = preproc$y_train
+  cv_y_test = preproc$y_test
+  # turn outcome into binary values
+  bin_y_train = ifelse(cv_y_train$outcome == 'stable', 0, 1)
+  # run SAM for feature selection
+  sam_result = sam(cv_x_train, bin_y_train, 
+                   gene.names = rownames(cv_x_train))
+  sam_summary = summary(sam_result, delta = 0.5)
+  all_genes_sig = sam_summary@mat.sig
+  rank = all_genes_sig |> 
+    arrange((abs(d.value)))
+  # loop through possible number of significant genes
+  for (n in n_vals) {
+    if (n > nrow(rank)) {
+      break
+    }
+    # select the top n genes
+    de = rownames(rank)[1:n]
+    cv_train_reduced = cv_x_train[de,]
+    cv_test_reduced = cv_x_test[de,]
+    # random forest to evaluate method performance
+    rf = randomForest(t(cv_train_reduced), cv_y_train$outcome)
+    pred_prob = predict(rf, t(cv_test_reduced), type = 'prob')[,'reject']
+    roc_obj = roc(response = cv_y_test$outcome, predictor = pred_prob)
+    # extract the method sensitivity
+    sam_perf[[index]] = data.frame(gene_number = n, 
+                                   auc = auc(roc_obj) |> as.numeric())
+    index = index + 1
+  }
+}
+# calculate the overall performance of each n value
+sam_perf = sam_perf |> bind_rows() |> drop_na()
+sam_rank = sam_perf |> 
+  group_by(gene_number) |> 
+  summarise(mean_auc = mean(auc)) |> 
+  arrange(desc(mean_auc))
+# visualize the performance of each n
+sam_rank_long = sam_rank |> 
+  pivot_longer(cols = mean_auc, names_to = 'metric', values_to = 'value')
+(ggplot(data = sam_rank_long, aes(x = gene_number, y = value)) +
+    geom_line() + 
+    labs(x = 'Gene number', y = 'Area Under the Curve (AUC)', title = 'Performance of SAM with different numbers of genes on Biopsy data') + 
+    theme_bw()) |> 
+  ggplotly()
+sam_rank |> datatable(colnames = c('Gene number', 'Mean AUC'))
+# retain the best performing n value
+best_sam = sam_perf |> 
+  filter(gene_number == 500)
+best_avg_perf[[6]] = data.frame(method = rep('SAM', nrow(best_sam)),
+                                best_sam)
+```
+
+### Networks
+
+```{r biopsy_networks_rank, warning = FALSE, message = FALSE}
+genes_part_1 = c('FAT1', 'CXCR2', 'CFI', 'FOLR1', 'PLS3', 'PDZK1', 'SGCE', 'RAI14', 'MITF', 'NSFL1C', 'SLC16A4', 'ATP5C1', 'TRAP1', 'PPP4R1', 'ARL1', 'BBOX1', 'TOM1L1', 'EMX2', 'NME5', 'DEFB1', 'SNX7', 'EPCAM', 'UNC13B', 'CDH16', 'TMEM47', 'IQGAP2', 'C7', 'MIPEP', 'DIP2C', 'VCAM1', 'SNX1', 'USP4', 'BAZ2B', 'EFHD1', 'CSRP2', 'EPS8', 'ENPP2', 'BCAR3', 'DNALI1', 'ABCD3', 'SPARCL1', 'HTRA1', 'CXCL12', 'GNG12', 'RBM39', 'DZIP1', 'DYNC2LI1', 'PPFIBP2', 'PTPN3', 'HPN', 'EHHADH', 'BAMBI', 'LGMN', 'ATP1B1', 'SLC16A2', 'LAMB1', 'GLDC', 'THAP11', 'PLS1', 'GUSB', 'GHR', 'LRP2', 'PSMD4', 'NCOA1', 'RCAN2', 'CDK20', 'PHYH', 'SLC22A2', 'SDC4', 'PTPRM', 'BHMT', 'MPDZ', 'SLCO2A1', 'TSPAN6', 'SPRY2', 'KDR', 'DSP', 'GALNT1', 'ESRRG', 'RARRES2', 'GPX3', 'PIR', 'PPP2R3A', 'CNN3', 'BPHL', 'PLLP', 'GNA12', 'GOT1', 'ENPEP', 'DDC', 'CLDN10', 'PCK1', 'CRYZ', 'LAMB2', 'GRB14', 'SULT1C2', 'ZNF204P', 'CTGF', 'PARM1', 'RND3', 'DPYS', 'PTH1R', 'TNFRSF21', 'HADH', 'BUB3', 'WWTR1', 'SYNCRIP', 'HSD11B2', 'HCK', 'SLC1A1', 'DSG2', 'RABGGTB', 'NPY1R', 'COX7B', 'PFN2', 'AHCYL1', 'FDPS', 'KL', 'MEIS2', 'PCGF2', 'ABCB1', 'ACOX2', 'RIOK3', 'FMO1', 'PARD3', 'HOXC6', 'PPBP', 'ANP32A', 'RGN', 'HYAL1', 'PCBD1', 'FZD6', 'TSPAN1', 'PRRG1', 'SLC27A2', 'AKR7A3', 'FAM107A', 'LUM', 'HLF', 'PTS', 'BMPR1A', 'BCL2L2', 'USP9X', 'PBX3', 'S100A12', 'ATP6AP2', 'FDX1', 'TBX2', 'MALL', 'MUT', 'SMAD1', 'GLYAT', 'SIM1', 'PRSS8', 'AOX1', 'TXNDC9', 'SDC1', 'RAB40B', 'PPP2R2A', 'ACADL', 'UBE2E1', 'PLAT', 'SOCS6', 'KCNJ1', 'CDH5', 'HOXB7', 'ILVBL', 'CLDN8', 'TSPYL5', 'FNBP1L', 'NCF2', 'NEDD4L', 'CELSR2', 'GPC4', 'PSMB1', 'PPP3CB', 'LAMC1', 'EML1', 'MYO1B', 'GSTM3', 'AGT', 'CADM1', 'MSH3', 'NCKAP1', 'PTOV1', 'GGH', 'COBL', 'FGR', 'LDOC1', 'NR2F2', 'MTX2', 'FBXL2', 'GNAI1', 'UMOD', 'EPB42', 'HOXA4', 'CRYM', 'NR2F1', 'STK17B', 'ANPEP', 'RIN2', 'SLC17A3', 'COL4A2', 'KRT18', 'PAX2', 'CUBN', 'SERPINA5', 'THY1', 'FZD7', 'CCND1', 'YAP1', 'HNF1B', 'SLC6A13', 'IQSEC1', 'SHANK2', 'PLEKHA6', 'PRODH2', 'LDB2', 'TSPAN8', 'PPIC', 'FARP2', 'UCHL1', 'TRIL', 'PLCG2', 'HSPA12A', 'SPA17', 'AQP9', 'FMO4', 'IQCK', 'MLF1', 'TRAF3IP1', 'ARNT2', 'ASAH1', 'ITGA2', 'GUCY1B3', 'AMOTL2', 'ETS2', 'VNN2', 'CHL1', 'SPR', 'NDUFA5', 'MNDA', 'JRKL', 'MYH10', 'RAB11FIP5', 'NID2', 'MCFD2', 'UBE3A', 'PTN', 'EPHX2', 'TLN2', 'APOM', 'PPL', 'MYO6', 'EFNA1', 'ATP5H', 'HSD17B4', 'RHOC', 'SLIT2', 'PGRMC2', 'PLOD2', 'ACO2', 'ABI1', 'MXRA5', 'CAV2', 'AIFM1', 'SPOCK1', 'FBXO7', 'FERMT2', 'SH3GL2', 'ATRN', 'DNMBP', 'ATP8B1', 'GLI3', 'VLDLR', 'SPAG5', 'SHROOM2', 'MAPK10', 'RALYL', 'PROS1', 'DIO1', 'PODXL', 'AGAP1', 'EPAS1', 'NEO1', 'CD34', 'DAO', 'NLGN1', 'C1R', 'ALKBH1', 'USH1C', 'ALAS2', 'HSPA2', 'RGL1', 'SUPT7L', 'TTLL1', 'GJB1', 'ALDH6A1', 'FAH', 'SNAI2', 'SERPINA6', 'ERBB3', 'SFRP1', 'CLCN5', 'SALL1', 'EDNRB', 'TNFRSF11B', 'GGCX', 'ANK3', 'WASF3', 'GNAS', 'MYO1F', 'ADH6', 'PROCR', 'PFKM', 'MNAT1', 'SOD3', 'NPR3', 'DNAJC22', 'HMGB3', 'FBLN5', 'TPD52L1', 'NUPR1', 'ENPP4', 'TMCC1', 'EIF3K', 'AFG3L2', 'DIRAS3', 'BUD31', 'NINL', 'ETFDH', 'IGFBP4', 'OLFML2A', 'ARHGEF5', 'PROM1', 'PTPRG', 'GAS2L1', 'TRAM2', 'COX7A1', 'TYMS', 'FGF9', 'MAOB', 'EI24', 'PPARG', 'CX3CL1', 'RNF40', 'NUFIP1')
+genes_part_2 = c('PITRM1', 'NET1', 'PGRMC1', 'HOXA5', 'SSX2IP', 'S100A9', 'CA12', 'UPK1B', 'RUNDC3B', 'PARVA', 'SERPINF2', 'GSTA4', 'SLC35A3', 'DICER1', 'PHLDA1', 'ATP2C1', 'B9D1', 'KPNA4', 'TJP1', 'PKD2', 'TCFL5', 'EPHA2', 'SUOX', 'STARD13', 'BCKDHB', 'UBE2D2', 'GYPC', 'B4GALT3', 'DPEP1', 'MUC1', 'FRAT2', 'SHC1', 'CAP2', 'CRELD1', 'ICMT', 'SELL', 'TCN2', 'HSPA4L', 'NUAK1', 'APOE', 'ANXA9', 'AQP1', 'ZFYVE9', 'LRBA', 'C11orf58', 'CFP', 'GEM', 'ARF3', 'BPTF', 'EXTL2', 'CPSF6', 'RWDD2A', 'VRK2', 'LGALS3BP', 'PSTPIP1', 'PARP2', 'FAM189A2', 'DNAJC8', 'SLC6A12', 'MCAM', 'ACTR3', 'DLD', 'PIK3C2G', 'IVNS1ABP', 'ING2', 'TIMP3', 'TBC1D2B', 'NDUFS1', 'HOMER1', 'PHB', 'RAPGEF3', 'ARSE', 'TTC28', 'GCLC', 'MMACHC', 'SPRY1', 'TOMM34', 'ZNF10', 'SEMA5A', 'XPNPEP2', 'UROS', 'MXRA8', 'CRTAP', 'PGM3', 'CALB1', 'CAV1', 'MAPT', 'NLRP1', 'NIT1', 'ALDH7A1', 'PPP1R1A', 'VDAC1', 'IFT88', 'HNF1A', 'ADH1C', 'MMP7', 'RHOBTB1', 'METTL1', 'KLKB1', 'TEAD3', 'DFNA5', 'BTBD3', 'IMMT', 'AASS', 'NCF4', 'NDN', 'ATP1A1', 'IGFBP5', 'AIMP1', 'LIMCH1', 'ITGB5', 'MTR', 'PRPF40A', 'LYN', 'SLC22A6', 'UGDH', 'MAOA', 'SCAMP5', 'PHF3', 'IGFBP3', 'PCDH17', 'S100P', 'IKZF1', 'PTPRD', 'MEGF9', 'SEPT10', 'GMPS', 'CTSF', 'MAPRE2', 'SUCLA2', 'HIBCH', 'ECHS1', 'SLC5A12', 'FKBP4', 'AR', 'AZGP1', 'RNH1', 'DNAJC6', 'AUH', 'PTP4A1', 'VEGFC', 'FCN1', 'CYLD', 'MRPS14', 'CXorf40A', 'CLIC4', 'FABP3', 'ARMCX2', 'THRB', 'EFEMP2', 'SLC2A2', 'KCNJ8', 'SOX9')
+network_rank = c(genes_part_1, genes_part_2)
+```
+
+```{r biopsy_networks, warning = FALSE, message = FALSE  }
+networks_perf = vector('list', length = 5 * length(n_vals))
+index = 1
+# loop to perform cross validation
+for (i in c(1:5)) {
+  # train-test folds split
+  preproc = fs_preproc(test_fold = i)
+  cv_x_train = preproc$x_train
+  cv_x_test = preproc$x_test
+  cv_y_train = preproc$y_train
+  cv_y_test = preproc$y_test
+  # loop to select optimal number of significant genes
+  for (n in n_vals) {
+    # select the top n genes
+    de = network_rank[1:n]
+    cv_train_reduced = cv_x_train[de,]
+    cv_test_reduced = cv_x_test[de,]
+    # random forest to evaluate the feature selectin method
+    rf = randomForest(t(cv_train_reduced), cv_y_train$outcome)
+    pred_prob = predict(rf, t(cv_test_reduced), type = 'prob')[,'reject']
+    roc_obj = roc(response = cv_y_test$outcome, predictor = pred_prob)
+    # extract sensitivity
+    networks_perf[[index]] = data.frame(gene_number = n, 
+                               auc = auc(roc_obj) |> as.numeric())
+    index = index + 1
+  }
+}
+# calculate the overall performance of each n value
+networks_perf = networks_perf |> bind_rows() |> drop_na()
+networks_rank = networks_perf |> 
+  group_by(gene_number) |> 
+  summarise(mean_auc = mean(auc)) |> 
+  arrange(desc(mean_auc))
+# visualize the performance of each n
+networks_rank_long = networks_rank |> 
+  pivot_longer(cols = mean_auc, names_to = 'metric', values_to = 'value')
+(ggplot(data = networks_rank_long, aes(x = gene_number, y = value)) +
+    geom_line() + 
+    labs(x = 'Gene number', y = 'Area Under the Curve (AUC)', title = 'Performance of Networks with different numbers of genes on Biopsy data') + 
+    theme_bw()) |> 
+  ggplotly()
+networks_rank |> datatable(colnames = c('Gene number', 'Mean AUC'))
+# retain the best performing n value
+best_avg_perf[[7]] = data.frame(method = rep('Network', 5),
+                                networks_perf |> 
+                                  filter(gene_number == 250))
+```
+
+### Comparative Boxplots
+
+```{r biopsy_comparative_boxplot, warning = FALSE, message = FALSE  }
+best_avg_perf = best_avg_perf |> bind_rows()
+best_avg_perf_long = best_avg_perf |> 
+  pivot_longer(cols = auc, names_to = 'metric', values_to = 'value')
+p3 = ggplot(best_avg_perf_long, aes(x = factor(method), y = value, fill = gene_number)) +
+  geom_boxplot() +
+  labs(
+    title = 'A. Biopsy',
+    y = 'Area Under Curve (AUC)', x = 'Feature Selection Methods'
+  ) + 
+  scale_fill_gradient(
+    name = 'Gene Number', 
+    low = 'white', 
+    high = 'black'
+  ) +
+  theme_bw()
+p3 |> ggplotly()
+best_avg_perf %>% 
+  group_by(method, gene_number) %>% 
+  summarise(mean_auc = mean(auc)) %>% 
+  arrange(desc(mean_auc)) |> 
+  datatable(colnames = c('Method', 'Gene number', 'Mean AUC'))
+```
+
+## Model Selection
+
+```{r biopsy_model_frame, warning = FALSE, message = FALSE  }
+model_selection = vector('list', length = 8)
+```
+
+### k-Nearest Neighbours (kNN)
+
+```{r biopsy_knn, warning = FALSE, message = FALSE  }
+k_vals = c(1, 3, 5, 7, 10, 15, 25)
+knn_perf = vector('list', 5 * length(k_vals) * length(thresholds))
+index = 1
+for (i in 1:5) {
+  preproc = biopsy_preproc(test_fold = i)
+  cv_train_reduced = preproc$x_train
+  cv_test_reduced = preproc$x_test
+  cv_y_train = preproc$y_train
+  cv_y_test = preproc$y_test
+  for (k in k_vals) {
+    knn = knn3(t(cv_train_reduced), cv_y_train$outcome, k = k)
+    pred_prob = predict(knn, t(cv_test_reduced))[,'reject']
+    for (t in thresholds) {
+    pred_class = ifelse(pred_prob > t, 'reject', 'stable') %>%
+      factor(levels = c('stable', 'reject'))
+    conf_mat = confusionMatrix(data = pred_class,
+                              reference = cv_y_test$outcome, positive = 'reject')
+    knn_perf[[index]] = data.frame(k = k, threshold = t,
+                                  f1 = conf_mat$byClass['F1'],
+                                  f2 = f2(pred_class, cv_y_test))
+    index = index + 1
+    }
+  }
+}
+knn_perf = bind_rows(knn_perf)
+knn_rank = knn_perf |>
+  group_by(k, threshold) |>
+  summarise(mean_f1 = mean(f1),
+            mean_f2 = mean(f2)) |>
+  arrange(desc(0.4 * mean_f1 + 0.6 * mean_f2), threshold)
+knn_rank_long = knn_rank |>
+  pivot_longer(cols = mean_f1:mean_f2, names_to = 'metric', values_to = 'value')
+knn_rank |> datatable(colnames = c('k', 'threshold', 'mean F1 score', 'mean F2 score'))
+model_selection[[1]] = data.frame(method = rep('KNN', 5),
+                                  knn_perf |>
+                                    filter(k == knn_rank$k[1]) |> 
+                                    filter(threshold == knn_rank$threshold[1]) |> 
+                                    select(-c(k, threshold)))
+```
+
+### Random Forest
+
+```{r biopsy_random_forest, warning = FALSE, message = FALSE  }
+set.seed(3888)
+mtry_vals = c(1, 2, 5)
+min.node.sizes = c(1, 2, 5)
+rf_perf = vector('list', length = 5 * length(thresholds) * length(mtry_vals) * length(min.node.sizes))
+index = 1
+for (i in c(1:5)) {
+  preproc = biopsy_preproc(test_fold = i)
+  cv_train_reduced = preproc$x_train
+  cv_test_reduced = preproc$x_test
+  cv_y_train = preproc$y_train
+  cv_y_test = preproc$y_test
+  cv_train_t = t(cv_train_reduced) |> data.frame()
+  cv_train_t$outcome = cv_y_train$outcome
+  for (mtry in mtry_vals) {
+    for (node in min.node.sizes) {
+      rf = ranger(outcome ~ ., data = cv_train_t,
+                  mtry = mtry, min.node.size = node, 
+                  probability = TRUE, splitrule = 'extratrees',
+                  classification = TRUE, scale = TRUE)
+      for (t in thresholds) {
+        pred_prob = predict(rf, data.frame(t(cv_test_reduced)), 
+                        type = 'response')$predictions[,'reject']
+        pred_class = ifelse(pred_prob > t, 'reject', 'stable') |> 
+          factor(levels = c('stable', 'reject'))
+        conf_mat = confusionMatrix(pred_class, cv_y_test$outcome)
+        rf_perf[[index]] = data.frame(mtry = mtry, min_node_size = node, threshold = t,
+                                      f1 = conf_mat$byClass['F1'],
+                                      f2 = f2(pred_class, cv_y_test))
+        index = index + 1
+      }
+    }
+  }
+}
+rf_perf = bind_rows(rf_perf)
+rf_perf_rank = rf_perf |> 
+  group_by(mtry, min_node_size, threshold) |> 
+  summarise(mean_f1 = mean(f1, na.rm = TRUE),
+            mean_f2 = mean(f2, na.rm = TRUE))|> 
+  arrange(desc(0.4 * mean_f1 + 0.6 * mean_f2))
+rf_perf_rank_long = rf_perf_rank |> 
+  pivot_longer(cols = mean_f1:mean_f2, names_to = 'metric', values_to = 'value')
+rf_perf_rank |> datatable(colnames = c('mtry', 'min.node.size', 'threshold', 'mean F1 score', 'mean F2 score'))
+model_selection[[2]]= data.frame(method = rep('RF', 5),
+                          rf_perf |> 
+                            filter(mtry == rf_perf_rank$mtry[1]) |> 
+                            filter(min_node_size == rf_perf_rank$min_node_size[1]) |>
+                            filter(threshold == rf_perf_rank$threshold[1]) |> 
+                            select(-c(mtry, min_node_size, threshold)))
+```
+
+### Logistic Regression
+
+```{r biopsy_log_regression, warning = FALSE, message = FALSE  }
+lambda_grid = 10^seq(-5, 0, length = 10)
+alpha_values = c(0.1, 0.4, 0.6, 0.9)
+log_perf = vector('list', length = 5 * length(lambda_grid) * length(alpha_values) * length(thresholds))
+index = 1
+for (i in c(1:5)) {
+  preproc = biopsy_preproc(test_fold = i)
+  cv_train_reduced = preproc$x_train
+  cv_test_reduced = preproc$x_test
+  cv_y_train = preproc$y_train
+  cv_y_test = preproc$y_test
+  for (lambda in lambda_grid) {
+    for (a in alpha_values) {
+      lr = glmnet(t(cv_train_reduced), cv_y_train$outcome, family = 'binomial', 
+                  alpha = a, lambda = lambda, standardize = FALSE)
+      pred_prob = predict(lr, t(cv_test_reduced), type = 'response')[,1]
+      for (t in thresholds) {
+        pred_class = ifelse(pred_prob > t, 'reject', 'stable') |>
+          factor(levels = c('stable', 'reject'))
+        conf_mat = confusionMatrix(cv_y_test$outcome, pred_class, positive = 'reject')
+        log_perf[[index]] = data.frame(lambda = lambda, alpha = a, threshold = t,
+                                       f1 = conf_mat$byClass['F1'], 
+                                       f2 = f2(pred_class, cv_y_test))
+        index = index + 1
+      }
+    }
+  }
+}
+log_perf = bind_rows(log_perf)
+log_perf_rank = log_perf |> 
+  group_by(lambda, alpha, threshold) |> 
+  summarise(mean_f1 = mean(f1, na.rm = TRUE),
+            mean_f2 = mean(f2, na.rm = TRUE)) |> 
+  arrange(desc(0.4 * mean_f1 + 0.6 * mean_f2))
+log_perf_rank_long = log_perf_rank |> 
+  pivot_longer(cols = mean_f1:mean_f2, names_to = 'metric', values_to = 'value')
+log_perf_rank |> datatable(colnames = c('lambda', 'alpha', 'threshold', 'mean F1 score', 'mean F2 score'))
+model_selection[[3]] = data.frame(method = rep('LR', 5),
+                                  log_perf |> 
+                                     filter(lambda == log_perf_rank$lambda[1]) |> 
+                                     filter(alpha == log_perf_rank$alpha[1]) |> 
+                                     filter(threshold == log_perf_rank$threshold[1]) |> 
+                                     select(-c(lambda, alpha, threshold)))
+```
+
+### SVM
+
+#### SVM Linear
+
+```{r biopsy_svm_linear, warning = FALSE, message = FALSE  }
+C_vals = 2^(-2:2)
+svm_linear_perf = vector('list', length = 5 * length(C_vals) * length(thresholds))
+index = 1
+for (i in c(1:5)) {
+  preproc = biopsy_preproc(test_fold = i)
+  cv_train_reduced = preproc$x_train
+  cv_test_reduced = preproc$x_test
+  cv_y_train = preproc$y_train
+  cv_y_test = preproc$y_test
+  for (c in C_vals) {
+    svm = svm(x = t(cv_train_reduced), y = cv_y_train$outcome, 
+              cost = c, kernel = 'linear', probability = TRUE)
+    pred_prob = predict(svm, t(cv_test_reduced), probability = TRUE) %>% 
+      attr('probabilities')
+    pred_prob = pred_prob[,'reject']
+    for (t in thresholds) {
+      pred_class = ifelse(pred_prob > t, 'reject', 'stable') %>%
+        factor(levels = c('stable', 'reject'))
+      conf_mat = confusionMatrix(data = pred_class, 
+                                reference = cv_y_test$outcome, positive = 'reject')
+      svm_linear_perf[[index]] = data.frame(C = c, threshold = t,
+                                            f1 = conf_mat$byClass['F1'],
+                                            f2 = f2(pred_class, cv_y_test))
+      index = index + 1
+    }
+  }
+}
+svm_linear_perf = bind_rows(svm_linear_perf)
+svm_linear_rank = svm_linear_perf %>% 
+  group_by(C, threshold) %>% 
+  summarise(mean_f1 = mean(f1),
+            mean_f2 = mean(f2)) %>% 
+  arrange(desc(0.4 * mean_f1 + 0.6 * mean_f2))
+svm_linear_rank |> datatable(colnames = c('C', 'threshold', 'mean F1 score', 'mean F2 score'))
+model_selection[[4]] = data.frame(method = rep('SVM-L', 5),
+                                  svm_linear_perf %>%
+                                     filter(C == svm_linear_rank$C[1]) %>% 
+                                     filter(threshold == svm_linear_rank$threshold[1]) |> 
+                                     select(-c(C, threshold)))
+```
+
+#### SVM Radial
+
+```{r biopsy_svm_radial, warning = FALSE, message = FALSE  }
+gamma_vals = 2^c(-10, -5, 0, 5, 10)
+svm_radial_perf = vector('list', length = 5 * length(C_vals) * length(gamma_vals) * length(thresholds))
+index = 1
+for (i in c(1:5)) {
+  preproc = biopsy_preproc(test_fold = i)
+  cv_train_reduced = preproc$x_train
+  cv_test_reduced = preproc$x_test
+  cv_y_train = preproc$y_train
+  cv_y_test = preproc$y_test
+  for (c in C_vals) {
+    for (gamma in gamma_vals) {
+      svm = svm(x = t(cv_train_reduced), y = cv_y_train$outcome, 
+                cost = c, kernel = 'radial', gamma = gamma, probability = TRUE)
+      pred_prob = predict(svm, t(cv_test_reduced), probability = TRUE) %>% 
+        attr('probabilities')
+      pred_prob = pred_prob[,'reject']
+      for (t in thresholds) {
+        pred_class = ifelse(pred_prob > t, 'reject', 'stable') %>%
+          factor(levels = c('stable', 'reject'))
+        conf_mat = confusionMatrix(data = pred_class, 
+                                  reference = cv_y_test$outcome, positive = 'reject')
+        svm_radial_perf[[index]] = data.frame(C = c, gamma = gamma, threshold = t,
+                                              f1 = conf_mat$byClass['F1'],
+                                              f2 = f2(pred_class, cv_y_test))
+        index = index + 1
+      }
+    }
+  }
+}
+svm_radial_perf = bind_rows(svm_radial_perf)
+svm_radial_rank = svm_radial_perf %>% 
+  group_by(C, gamma, threshold) %>% 
+  summarise(mean_f1 = mean(f1),
+            mean_f2 = mean(f2)) %>% 
+  arrange(desc(0.4 * mean_f1 + 0.6 * mean_f2))
+svm_radial_rank |>
+  datatable(colnames = c('C', 'gamma', 'threshold', 'mean F1 score', 'mean F2 score'))
+model_selection[[5]] = data.frame(method = rep('SVM-R', 5),
+                                  svm_radial_perf %>% 
+                                     filter(C == svm_radial_rank$C[1]) %>% 
+                                     filter(gamma == svm_radial_rank$gamma[1]) %>% 
+                                     filter(threshold == svm_radial_rank$threshold[1]) |> 
+                                     select(-c(C, gamma, threshold)))
+```
+
+#### SVM Polynomial
+
+```{r biopsy_svm_polynomial, warning = FALSE, message = FALSE  }
+degrees = c(2,3,4)
+zero_coef = c(0, 1, 10)
+svm_poly_perf = vector('list', length = 5 * length(degrees) * length(zero_coef) * length(thresholds) * length(C_vals))
+index = 1
+for (i in c(1:5)) {
+  preproc = biopsy_preproc(test_fold = i)
+  cv_train_reduced = preproc$x_train
+  cv_test_reduced = preproc$x_test
+  cv_y_train = preproc$y_train
+  cv_y_test = preproc$y_test
+  for (c in C_vals) {
+    for (d in  degrees) {
+      for (z in zero_coef) {
+        svm = svm(x = t(cv_train_reduced), y = cv_y_train$outcome,
+                        cost = c, kernel = 'polynomial', degree = d,
+                        coef0 = z, probability = TRUE)
+        pred_prob = predict(svm, t(cv_test_reduced), probability = TRUE) %>% 
+          attr('probabilities')
+        pred_prob = pred_prob[,'reject']
+        for (t in thresholds) {
+          pred_class = ifelse(pred_prob > t, 'reject', 'stable') %>%
+            factor(levels = c('stable', 'reject'))
+          conf_mat = confusionMatrix(data = pred_class, 
+                                    reference = cv_y_test$outcome, 
+                                    positive = 'reject')
+          svm_poly_perf[[index]] = data.frame(C = c, degree = d, coef0 = z, 
+                                              threshold = t,
+                                              f1 = conf_mat$byClass['F1'],
+                                              f2 = f2(pred_class, cv_y_test))
+          index = index + 1
+        }
+      }
+    }
+  }
+}
+svm_poly_perf = bind_rows(svm_poly_perf)
+svm_poly_rank = svm_poly_perf %>% 
+  group_by(C, degree, coef0, threshold) %>% 
+  summarise(mean_f1 = mean(f1),
+            mean_f2 = mean(f2)) %>% 
+  arrange(desc(0.4 * mean_f1 + 0.6 * mean_f2))
+svm_poly_rank |> 
+  datatable(colnames = c('C', 'degree', 'coef0', 'threshold', 
+                         'mean F1 score', 'mean F2 score'))
+model_selection[[6]] = data.frame(method = rep('SVM-P', 5),
+                                  svm_poly_perf %>% 
+                                     filter(C == svm_poly_rank$C[1]) %>% 
+                                     filter(degree == svm_poly_rank$degree[1]) %>% 
+                                     filter(coef0 == svm_poly_rank$coef0[1]) %>% 
+                                     filter(threshold == svm_poly_rank$threshold[1]) |> 
+                                     select(-c(C, degree, coef0, threshold)))
+```
+
+#### SVM Sigmoid
+
+```{r biopsy_svm_sigmoid, warning = FALSE, message = FALSE  }
+svm_sigmoid_perf = vector('list', length = 5 * length(thresholds) * length(C_vals) * length(gamma_vals) * length(zero_coef))
+index = 1
+for (i in c(1:5)) {
+  preproc = biopsy_preproc(test_fold = i)
+  cv_train_reduced = preproc$x_train
+  cv_test_reduced = preproc$x_test
+  cv_y_train = preproc$y_train
+  cv_y_test = preproc$y_test
+  for (c in C_vals) {
+    for(g in gamma_vals) {
+      for (z in zero_coef) {
+        svm = svm(x = t(cv_train_reduced), y = cv_y_train$outcome,
+                        cost = c, kernel = 'sigmoid', gamma = g,
+                        coef0 = z, probability = TRUE)
+        pred_prob = predict(svm, t(cv_test_reduced), probability = TRUE) %>% 
+          attr('probabilities')
+        pred_prob = pred_prob[,'reject']
+        for (t in thresholds) {
+          pred_class = ifelse(pred_prob > t, 'reject', 'stable') %>%
+            factor(levels = c('stable', 'reject'))
+          conf_mat = confusionMatrix(data = pred_class, 
+                                    reference = cv_y_test$outcome, 
+                                    positive = 'reject')
+          svm_sigmoid_perf[[index]] = data.frame(C = c, gamma = g, coef0 = z, threshold = t,
+                                                 f1 = conf_mat$byClass['F1'],
+                                                 f2 = f2(pred_class, cv_y_test))
+          index = index + 1
+        }
+      }
+    }
+  }
+}
+svm_sigmoid_perf = svm_sigmoid_perf |> bind_rows()
+svm_sigmoid_rank = svm_sigmoid_perf %>% 
+  group_by(C, gamma, coef0, threshold) %>% 
+  summarise(mean_f1 = mean(f1),
+            mean_f2 = mean(f2)) %>% 
+  arrange(desc(0.4 * mean_f1 + 0.6 * mean_f2))
+svm_sigmoid_rank |> 
+  datatable(colnames = c('C', 'gamma', 'coef0', 'threshold', 'mean F1 score', 'mean F2 score'))
+model_selection[[7]] = data.frame(method = rep('SVM-S', 5),
+                                  svm_sigmoid_perf %>% 
+                                     filter(C == svm_sigmoid_rank$C[1]) %>% 
+                                     filter(gamma == svm_sigmoid_rank$gamma[1]) %>% 
+                                     filter(coef0 == svm_sigmoid_rank$coef0[1]) %>% 
+                                     filter(threshold == svm_sigmoid_rank$threshold[1]) |> 
+                                     select(-c(C, gamma, coef0, threshold)))
+```
+
+### XGBoost
+
+```{r biopsy_xgboost, warning = FALSE, message = FALSE  }
+eta_vals = c(0.05, 0.1, 0.3, 0.5, 0.8)
+max_depth_vals = c(1,4,5,7,8)
+nrounds = c(10, 15, 20, 30, 50, 75, 100)
+xgb_perf = vector('list', length = 5 * length(eta_vals) * length(max_depth_vals) * length(nrounds))
+index = 1
+for (i in c(1:5)) {
+  preproc = biopsy_preproc(test_fold = i)
+  cv_train_reduced = preproc$x_train
+  cv_test_reduced = preproc$x_test
+  cv_y_train = preproc$y_train
+  cv_y_test = preproc$y_test
+  dtrain = xgb.DMatrix(data = t(cv_train_reduced),
+                       label = ifelse(cv_y_train$outcome == 'stable', 0, 1))
+  dtest = xgb.DMatrix(data = t(cv_test_reduced))
+  for(e in eta_vals) {
+    for (d in max_depth_vals) {
+      for (n in nrounds) {
+         params = list(objective = 'binary:logistic',
+                      eval_metric = 'aucpr',
+                      eta = e,
+                      max_depth = d)
+          xgb = xgb.train(params = params, data = dtrain, nrounds = n, verbose = 0)
+          pred_prob = predict(xgb, dtest)
+          for (t in thresholds) {
+            pred_class = ifelse(pred_prob > t, 'reject', 'stable') %>%
+              factor(levels = c('stable','reject'))
+            conf_mat = confusionMatrix(data = pred_class, 
+                                      reference = cv_y_test$outcome,
+                                      positive = 'reject')
+            xgb_perf[[index]] = data.frame(eta = e, max_depth = d, nrounds = n, threshold = t,
+                                           f1 = conf_mat$byClass['F1'],
+                                           f2 = f2(pred_class, cv_y_test))
+            index = index + 1
+        }
+      }
+    }
+  }
+}
+xgb_perf = xgb_perf |> bind_rows()
+xgb_rank = xgb_perf %>% 
+  group_by(eta, max_depth, nrounds, threshold) %>% 
+  summarise(mean_f1 = mean(f1),
+            mean_f2 = mean(f2)) %>% 
+  arrange(desc(0.4 * mean_f1 + 0.6 * mean_f2))
+xgb_rank |> 
+  datatable(colnames = c('eta', 'max depth', 'nrounds', 'threshold', 
+                         'mean F1 score', 'mean F2 score'))
+model_selection[[8]] = data.frame(method = rep('XGB', 5),
+                                  xgb_perf %>% 
+                                    filter(eta == xgb_rank$eta[1]) %>% 
+                                    filter(max_depth == xgb_rank$max_depth[1]) %>% 
+                                    filter(nrounds == xgb_rank$nrounds[1]) %>% 
+                                    filter(threshold == xgb_rank$threshold[1]) |> 
+                                    select(-c(eta, max_depth, nrounds, threshold)))
+```
+
+### Comparative Boxplots
+
+```{r biopsy_model_comparison, warning = FALSE, message = FALSE  }
+model_selection = model_selection |> bind_rows()
+model_selection_long = model_selection |> 
+  pivot_longer(cols = f1:f2, names_to = 'metric', values_to = 'value')
+p4 = ggplot(data = model_selection_long, aes(x = method, y = value)) + 
+  geom_boxplot() +
+  facet_wrap(~metric) + 
+    labs(title = 'A. Biopsy',
+         x = 'Model', y = 'Performance') +
+    theme_bw()
+p4 |> ggplotly()
+sum_model_selection = model_selection |> 
+  group_by(method) |> 
+  summarise(mean_f1 = mean(f1),
+            mean_f2 = mean(f2)) %>% 
+  arrange(desc(0.4 * mean_f1 + 0.6 * mean_f2))
+sum_model_selection_long = sum_model_selection |> 
+  pivot_longer(cols = mean_f1:mean_f2, names_to = 'metric', values_to = 'value')
+sum_model_selection |> 
+  datatable(colnames = c('Model', 'Mean F1 score', 'Mean F2 score'))
+```
+
+## Model Construction & Evaluation
+
+```{r biopsy_model, warning = FALSE, message = FALSE  }
+set.seed(3888)
+# batch correction
+train_batched = ComBat(X_train, y_train$original_dataset)
+# normalize
+norm = normalize(train_batched, X_test)
+train_normed = norm$train
+test_normed = norm$test
+# feature selection
+de = biopsy_de(train_normed, y_train)
+train_de = train_normed[de,]
+test_de = test_normed[de,]
+# fine-tuned rf parameters
+best_mtry = rf_perf_rank$mtry[1]
+best_min_node = rf_perf_rank$min_node_size[1]
+best_threshold = rf_perf_rank$threshold[1]
+# model construction
+train_t = t(train_de) |> data.frame()
+train_t$outcome = y_train$outcome
+rf = ranger(outcome ~ ., data = train_t,
+                  mtry = best_mtry, min.node.size = best_min_node, 
+                  probability = TRUE, splitrule = 'extratrees',
+                  classification = TRUE, scale = TRUE)
+# perform model on test set
+pred_prob = predict(rf, test_de |> t() |> data.frame(), 
+                    type = 'response')$predictions[,'reject']
+
+pred_class = ifelse(pred_prob > best_threshold, 'reject', 'stable') |> 
+  factor(levels = c('stable', 'reject'))
+# performance evaluation
+confusionMatrix(data = pred_class, reference = y_test$outcome, positive = 'reject')
+```
+
+## Save the plots for the final report
+
+```{r biopsy_plots, warning = FALSE, message = FALSE  }
+plot_list$biopsy_pca_noBatch = p1
+plot_list$biopsy_pca_batch = p2
+plot_list$biopsy_feature_selection = p3
+plot_list$biopsy_model = p4
+# save the plots into a RDS file for reuse in the final report
+saveRDS(plot_list, 'plots_finalReport.rds')
+```
